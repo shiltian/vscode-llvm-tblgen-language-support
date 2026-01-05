@@ -1,0 +1,87 @@
+{
+  "name": "llvm-tablegen-language-support",
+  "displayName": "LLVM TableGen Language Support",
+  "description": "Syntax highlighting and language server support for LLVM TableGen files",
+  "version": "0.1.0",
+  "publisher": "shiltian",
+  "author": {
+    "name": "Shilei Tian"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shiltian/vscode-llvm-tblgen-language-support"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:tablegen"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "tablegen",
+        "aliases": [
+          "TableGen",
+          "tablegen"
+        ],
+        "extensions": [
+          ".td"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tablegen",
+        "scopeName": "source.tablegen",
+        "path": "./syntaxes/tablegen.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "tablegen.restartServer",
+        "title": "TableGen: Restart Language Server"
+      },
+      {
+        "command": "tablegen.reindex",
+        "title": "TableGen: Force Reindex"
+      },
+      {
+        "command": "tablegen.showOutput",
+        "title": "TableGen: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "TableGen",
+      "properties": {
+        "tablegen.compileCommandsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to tablegen_compile_commands.yml. If empty, defaults to ${workspaceFolder}/tablegen_compile_commands.yml"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0",
+    "vscode-languageserver": "^9.0.0",
+    "vscode-languageserver-textdocument": "^1.0.0"
+  }
+}
