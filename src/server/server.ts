@@ -28,7 +28,7 @@ import { parseTableGen } from './parser';
 import { SymbolTable, SymbolCollector } from './symbols';
 import { IncludeGraph } from './includeGraph';
 import { parseCompileCommands, buildRootFileMap } from './compileCommands';
-import { ParsedFile, SymbolKind, FieldAccess, Expression } from './types';
+import { ParsedFile, SymbolKind, FieldAccess, Expression, MultiClassDef, Statement } from './types';
 import { TypeSystem, TypeCollector, TypeInfo } from './typeSystem';
 
 // Create connection and document manager
@@ -263,6 +263,16 @@ async function ensureFilesIndexed(filePath: string): Promise<boolean> {
         }
     }
 
+    // Second pass: register composite defm symbols now that all multiclass
+    // definitions are available in parsedFiles
+    for (const file of toIndex) {
+        const uri = 'file://' + file;
+        const parsed = parsedFiles.get(uri);
+        if (parsed) {
+            registerCompositeDefmSymbols(parsed, uri);
+        }
+    }
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     sendLog(`Indexed ${indexed} files (${errors} errors) in ${elapsed}s`);
     sendStatus('TableGen ready', 'ready');
@@ -296,6 +306,93 @@ function parseAndIndexFile(uri: string): ParsedFile | undefined {
     typeCollector.collect(parsed);
 
     return parsed;
+}
+
+/**
+ * Find a MultiClassDef node by name across all parsed files.
+ */
+function findMulticlassNode(name: string): MultiClassDef | undefined {
+    for (const parsed of parsedFiles.values()) {
+        for (const stmt of parsed.statements) {
+            if (stmt.type === 'MultiClassDef' && stmt.name.name === name) {
+                return stmt;
+            }
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Collect all def name suffixes produced by a multiclass body.
+ * Handles direct defs and nested defm instantiations recursively.
+ */
+function collectDefSuffixes(mc: MultiClassDef): string[] {
+    const suffixes: string[] = [];
+    collectDefSuffixesFromBody(mc.body, suffixes);
+    return suffixes;
+}
+
+function collectDefSuffixesFromBody(body: Statement[], suffixes: string[]): void {
+    for (const stmt of body) {
+        if (stmt.type === 'RecordDef' && stmt.name) {
+            suffixes.push(stmt.name.name);
+        } else if (stmt.type === 'DefmDef' && stmt.name) {
+            // Nested defm: composite suffix = defm_name + sub-multiclass suffixes
+            for (const parent of stmt.parentClasses) {
+                const nestedMc = findMulticlassNode(parent.name.name);
+                if (nestedMc) {
+                    for (const sub of collectDefSuffixes(nestedMc)) {
+                        suffixes.push(stmt.name.name + sub);
+                    }
+                }
+            }
+        } else if (stmt.type === 'ForeachStatement' || stmt.type === 'IfStatement') {
+            // Recurse into foreach/if bodies
+            if (stmt.type === 'ForeachStatement') {
+                collectDefSuffixesFromBody(stmt.body, suffixes);
+            } else {
+                collectDefSuffixesFromBody(stmt.thenBody, suffixes);
+                collectDefSuffixesFromBody(stmt.elseBody, suffixes);
+            }
+        }
+    }
+}
+
+/**
+ * Register composite defm symbols for a parsed file.
+ * For each named defm that references a multiclass, register
+ * defm_name + def_suffix as a global symbol pointing to the defm.
+ */
+function registerCompositeDefmSymbols(parsed: ParsedFile, uri: string): void {
+    registerCompositeDefmSymbolsFromStatements(parsed.statements, uri);
+}
+
+function registerCompositeDefmSymbolsFromStatements(statements: Statement[], uri: string): void {
+    for (const stmt of statements) {
+        if (stmt.type === 'DefmDef' && stmt.name) {
+            const defmName = stmt.name.name;
+            const defmLocation = { uri, range: stmt.name.range };
+            for (const parent of stmt.parentClasses) {
+                const mcDef = findMulticlassNode(parent.name.name);
+                if (mcDef) {
+                    const suffixes = collectDefSuffixes(mcDef);
+                    for (const suffix of suffixes) {
+                        symbolTable.addSymbol({
+                            name: defmName + suffix,
+                            kind: 'def',
+                            location: defmLocation,
+                        });
+                    }
+                }
+            }
+        } else if (stmt.type === 'DefsetDef' || stmt.type === 'ForeachStatement') {
+            // Recurse into defset/foreach bodies where defm can appear
+            registerCompositeDefmSymbolsFromStatements(stmt.body, uri);
+        } else if (stmt.type === 'IfStatement') {
+            registerCompositeDefmSymbolsFromStatements(stmt.thenBody, uri);
+            registerCompositeDefmSymbolsFromStatements(stmt.elseBody, uri);
+        }
+    }
 }
 
 async function ensureGraphBuilt(): Promise<void> {
@@ -355,6 +452,9 @@ documents.onDidChangeContent((event) => {
     typeSystem.clearFile(uri);
     const typeCollector = new TypeCollector(typeSystem, uri);
     typeCollector.collect(parsed);
+
+    // Re-register composite defm symbols (multiclasses already indexed from initial pass)
+    registerCompositeDefmSymbols(parsed, uri);
 });
 
 documents.onDidClose(() => {
