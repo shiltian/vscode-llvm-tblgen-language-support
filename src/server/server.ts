@@ -323,37 +323,81 @@ function findMulticlassNode(name: string): MultiClassDef | undefined {
 }
 
 /**
- * Collect all def name suffixes produced by a multiclass body.
- * Handles direct defs and nested defm instantiations recursively.
+ * Collect all def name suffixes produced by a multiclass.
+ * Includes:
+ * - direct defs in the multiclass body
+ * - inherited defs from parent multiclasses
+ * - nested defm-derived suffixes
  */
-function collectDefSuffixes(mc: MultiClassDef): string[] {
-    const suffixes: string[] = [];
-    collectDefSuffixesFromBody(mc.body, suffixes);
-    return suffixes;
+function collectDefSuffixes(
+    mc: MultiClassDef,
+    cache: Map<string, Set<string>>,
+    visiting: Set<string> = new Set(),
+): Set<string> {
+    const cacheKey = mc.name.name;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        return cached;
+    }
+
+    if (visiting.has(cacheKey)) {
+        // Cycle guard for malformed recursive multiclass graphs.
+        return new Set();
+    }
+
+    visiting.add(cacheKey);
+
+    const suffixes = new Set<string>();
+
+    // Inherit suffixes from parent multiclasses first.
+    for (const parent of mc.parentClasses) {
+        const parentMc = findMulticlassNode(parent.name.name);
+        if (parentMc) {
+            for (const inherited of collectDefSuffixes(parentMc, cache, visiting)) {
+                suffixes.add(inherited);
+            }
+        }
+    }
+
+    // Then collect local body suffixes (defs, nested defm, and control-flow bodies).
+    collectDefSuffixesFromBody(mc.body, suffixes, cache, visiting);
+
+    visiting.delete(cacheKey);
+
+    // Normalize order for deterministic behavior and cache the normalized set.
+    const sortedSuffixes = new Set(Array.from(suffixes).sort());
+    cache.set(cacheKey, sortedSuffixes);
+    return sortedSuffixes;
 }
 
-function collectDefSuffixesFromBody(body: Statement[], suffixes: string[]): void {
+function collectDefSuffixesFromBody(
+    body: Statement[],
+    suffixes: Set<string>,
+    cache: Map<string, Set<string>>,
+    visiting: Set<string>,
+): void {
     for (const stmt of body) {
         if (stmt.type === 'RecordDef' && stmt.name) {
-            suffixes.push(stmt.name.name);
+            suffixes.add(stmt.name.name);
         } else if (stmt.type === 'DefmDef' && stmt.name) {
             // Nested defm: composite suffix = defm_name + sub-multiclass suffixes
             for (const parent of stmt.parentClasses) {
                 const nestedMc = findMulticlassNode(parent.name.name);
                 if (nestedMc) {
-                    for (const sub of collectDefSuffixes(nestedMc)) {
-                        suffixes.push(stmt.name.name + sub);
+                    for (const sub of collectDefSuffixes(nestedMc, cache, visiting)) {
+                        suffixes.add(stmt.name.name + sub);
                     }
                 }
             }
-        } else if (stmt.type === 'ForeachStatement' || stmt.type === 'IfStatement') {
-            // Recurse into foreach/if bodies
-            if (stmt.type === 'ForeachStatement') {
-                collectDefSuffixesFromBody(stmt.body, suffixes);
-            } else {
-                collectDefSuffixesFromBody(stmt.thenBody, suffixes);
-                collectDefSuffixesFromBody(stmt.elseBody, suffixes);
-            }
+        } else if (
+            stmt.type === 'DefsetDef' ||
+            stmt.type === 'ForeachStatement' ||
+            stmt.type === 'LetStatement'
+        ) {
+            collectDefSuffixesFromBody(stmt.body, suffixes, cache, visiting);
+        } else if (stmt.type === 'IfStatement') {
+            collectDefSuffixesFromBody(stmt.thenBody, suffixes, cache, visiting);
+            collectDefSuffixesFromBody(stmt.elseBody, suffixes, cache, visiting);
         }
     }
 }
@@ -364,33 +408,47 @@ function collectDefSuffixesFromBody(body: Statement[], suffixes: string[]): void
  * defm_name + def_suffix as a global symbol pointing to the defm.
  */
 function registerCompositeDefmSymbols(parsed: ParsedFile, uri: string): void {
-    registerCompositeDefmSymbolsFromStatements(parsed.statements, uri);
+    const suffixCache = new Map<string, Set<string>>();
+    registerCompositeDefmSymbolsFromStatements(parsed.statements, uri, suffixCache);
 }
 
-function registerCompositeDefmSymbolsFromStatements(statements: Statement[], uri: string): void {
+function registerCompositeDefmSymbolsFromStatements(
+    statements: Statement[],
+    uri: string,
+    suffixCache: Map<string, Set<string>>,
+): void {
     for (const stmt of statements) {
         if (stmt.type === 'DefmDef' && stmt.name) {
             const defmName = stmt.name.name;
             const defmLocation = { uri, range: stmt.name.range };
+            const compositeNames = new Set<string>();
             for (const parent of stmt.parentClasses) {
                 const mcDef = findMulticlassNode(parent.name.name);
                 if (mcDef) {
-                    const suffixes = collectDefSuffixes(mcDef);
+                    const suffixes = collectDefSuffixes(mcDef, suffixCache);
                     for (const suffix of suffixes) {
-                        symbolTable.addSymbol({
-                            name: defmName + suffix,
-                            kind: 'def',
-                            location: defmLocation,
-                        });
+                        compositeNames.add(defmName + suffix);
                     }
                 }
             }
-        } else if (stmt.type === 'DefsetDef' || stmt.type === 'ForeachStatement') {
-            // Recurse into defset/foreach bodies where defm can appear
-            registerCompositeDefmSymbolsFromStatements(stmt.body, uri);
+
+            for (const compositeName of Array.from(compositeNames).sort()) {
+                symbolTable.addSymbol({
+                    name: compositeName,
+                    kind: 'def',
+                    location: defmLocation,
+                });
+            }
+        } else if (
+            stmt.type === 'DefsetDef' ||
+            stmt.type === 'ForeachStatement' ||
+            stmt.type === 'LetStatement'
+        ) {
+            // Recurse into bodies where defm can appear.
+            registerCompositeDefmSymbolsFromStatements(stmt.body, uri, suffixCache);
         } else if (stmt.type === 'IfStatement') {
-            registerCompositeDefmSymbolsFromStatements(stmt.thenBody, uri);
-            registerCompositeDefmSymbolsFromStatements(stmt.elseBody, uri);
+            registerCompositeDefmSymbolsFromStatements(stmt.thenBody, uri, suffixCache);
+            registerCompositeDefmSymbolsFromStatements(stmt.elseBody, uri, suffixCache);
         }
     }
 }
