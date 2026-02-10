@@ -2,7 +2,7 @@
   "name": "llvm-tablegen-language-support",
   "displayName": "LLVM TableGen Language Support",
   "description": "Syntax highlighting and language server support for LLVM TableGen files",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "shiltian",
   "author": {
     "name": "Shilei Tian"
