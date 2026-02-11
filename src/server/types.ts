@@ -190,6 +190,7 @@ export interface DagArg extends ASTNode {
 export interface BangOperator extends ASTNode {
     type: 'BangOperator';
     operator: string;
+    typeArgText?: string;
     args: Expression[];
 }
 

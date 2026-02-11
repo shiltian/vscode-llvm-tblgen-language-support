@@ -28,7 +28,7 @@ import { parseTableGen } from './parser';
 import { SymbolTable, SymbolCollector } from './symbols';
 import { IncludeGraph } from './includeGraph';
 import { parseCompileCommands, buildRootFileMap } from './compileCommands';
-import { ParsedFile, SymbolKind, FieldAccess, Expression, MultiClassDef, Statement } from './types';
+import { ParsedFile, SymbolKind, FieldAccess, Expression, MultiClassDef, Statement, DefvarDef, Symbol } from './types';
 import { TypeSystem, TypeCollector, TypeInfo } from './typeSystem';
 
 // Create connection and document manager
@@ -1035,6 +1035,109 @@ function resolveLetBindingTarget(
     return null;
 }
 
+function isSameRange(a: { start: { line: number; character: number }; end: { line: number; character: number } }, b: { start: { line: number; character: number }; end: { line: number; character: number } }): boolean {
+    return a.start.line === b.start.line &&
+        a.start.character === b.start.character &&
+        a.end.line === b.end.line &&
+        a.end.character === b.end.character;
+}
+
+function findDefvarForSymbol(symbol: Symbol): DefvarDef | undefined {
+    const parsed = parsedFiles.get(symbol.location.uri);
+    if (!parsed) {
+        return undefined;
+    }
+
+    return findDefvarInStatements(parsed.statements, symbol.name, symbol.location.range);
+}
+
+function findDefvarInStatements(
+    statements: Statement[],
+    defvarName: string,
+    targetRange?: { start: { line: number; character: number }; end: { line: number; character: number } }
+): DefvarDef | undefined {
+    for (const stmt of statements) {
+        switch (stmt.type) {
+            case 'DefvarDef': {
+                if (stmt.name.name !== defvarName) {
+                    break;
+                }
+                if (!targetRange || isSameRange(stmt.name.range, targetRange)) {
+                    return stmt;
+                }
+                break;
+            }
+            case 'ClassDef':
+            case 'RecordDef':
+            case 'MultiClassDef':
+            case 'DefsetDef':
+            case 'LetStatement':
+            case 'ForeachStatement': {
+                const nested = findDefvarInStatements(stmt.body, defvarName, targetRange);
+                if (nested) {
+                    return nested;
+                }
+                break;
+            }
+            case 'IfStatement': {
+                const nestedThen = findDefvarInStatements(stmt.thenBody, defvarName, targetRange);
+                if (nestedThen) {
+                    return nestedThen;
+                }
+                const nestedElse = findDefvarInStatements(stmt.elseBody, defvarName, targetRange);
+                if (nestedElse) {
+                    return nestedElse;
+                }
+                break;
+            }
+        }
+    }
+
+    return undefined;
+}
+
+function normalizeCastTypeName(typeArgText: string): string | undefined {
+    const trimmed = typeArgText.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+
+    // For !cast<Foo<Bar>>(...) we need the outer type name "Foo".
+    const withoutTemplates = trimmed.split('<')[0].trim();
+    const match = withoutTemplates.match(/[A-Za-z_][A-Za-z0-9_]*/);
+    if (!match) {
+        return undefined;
+    }
+
+    return match[0];
+}
+
+function inferTypeFromExpression(
+    expr: Expression,
+    _scope: string | undefined,
+    _uri: string
+): TypeInfo | undefined {
+    if (expr.type !== 'BangOperator') {
+        return undefined;
+    }
+
+    if (expr.operator !== '!cast' || !expr.typeArgText) {
+        return undefined;
+    }
+
+    const castTypeName = normalizeCastTypeName(expr.typeArgText);
+    if (!castTypeName) {
+        return undefined;
+    }
+
+    // Only return class types that are known by the type system.
+    if (!typeSystem.getClass(castTypeName)) {
+        return undefined;
+    }
+
+    return { kind: 'class', name: castTypeName };
+}
+
 /**
  * Try to resolve the type of an identifier in the given scope
  */
@@ -1069,9 +1172,15 @@ function resolveIdentifierType(name: string, scope: string | undefined, uri: str
     const symbol = symbolTable.findDefinition(name, scope);
     if (symbol) {
         if (symbol.kind === 'defvar') {
-            // For defvar, we need to look at what it's assigned to
-            // This would require expression type inference which is more complex
-            sendLog(`Found defvar '${name}' but expression type inference not yet implemented`);
+            const defvarStmt = findDefvarForSymbol(symbol);
+            if (defvarStmt) {
+                const inferredType = inferTypeFromExpression(defvarStmt.value, scope, uri);
+                if (inferredType) {
+                    sendLog(`Resolved '${name}' via !cast to '${inferredType.name}'`);
+                    return inferredType;
+                }
+            }
+            sendLog(`Found defvar '${name}' but could not infer initializer type`);
         } else if (symbol.kind === 'templateArg') {
             // Template arg - already handled above
         } else if (symbol.kind === 'def' || symbol.kind === 'defm') {

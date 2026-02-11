@@ -559,18 +559,8 @@ export class Parser {
         const start = this.peek().range.start;
         const opToken = this.advance();
         const operator = opToken.value;
+        const typeArgText = this.parseBangTypeArgumentText();
         const args: Expression[] = [];
-
-        if (this.match('punctuation', '<')) {
-            // Type argument
-            this.advance();
-            while (!this.match('punctuation', '>') && !this.match('eof', '')) {
-                this.advance();
-            }
-            if (this.match('punctuation', '>')) {
-                this.advance();
-            }
-        }
 
         if (this.match('punctuation', '(')) {
             this.advance();
@@ -588,9 +578,46 @@ export class Parser {
         return {
             type: 'BangOperator',
             operator,
+            typeArgText,
             args,
             range: { start, end: this.peek().range.start }
         };
+    }
+
+    private parseBangTypeArgumentText(): string | undefined {
+        if (!this.match('punctuation', '<')) {
+            return undefined;
+        }
+
+        this.advance(); // <
+        let angleDepth = 1;
+        const typeTokens: string[] = [];
+
+        while (angleDepth > 0 && !this.match('eof', '')) {
+            const token = this.advance();
+
+            if (token.type === 'punctuation' && token.value === '<') {
+                angleDepth++;
+                typeTokens.push(token.value);
+                continue;
+            }
+
+            if (token.type === 'punctuation' && token.value === '>') {
+                angleDepth--;
+                if (angleDepth === 0) {
+                    break;
+                }
+                typeTokens.push(token.value);
+                continue;
+            }
+
+            // Tokens are pre-trimmed, so joining without separators keeps
+            // canonical type spellings like Foo<Bar>.
+            typeTokens.push(token.type === 'string' ? `"${token.value}"` : token.value);
+        }
+
+        const typeArgText = typeTokens.join('').trim();
+        return typeArgText.length > 0 ? typeArgText : undefined;
     }
 
     private parseList(): Expression {
