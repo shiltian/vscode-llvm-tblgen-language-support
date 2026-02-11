@@ -28,8 +28,13 @@ import { parseTableGen } from './parser';
 import { SymbolTable, SymbolCollector } from './symbols';
 import { IncludeGraph } from './includeGraph';
 import { parseCompileCommands, buildRootFileMap } from './compileCommands';
-import { ParsedFile, SymbolKind, FieldAccess, Expression, MultiClassDef, Statement, DefvarDef, Symbol } from './types';
+import { ParsedFile, SymbolKind, FieldAccess, Expression, MultiClassDef, DefvarDef, Symbol } from './types';
 import { TypeSystem, TypeCollector, TypeInfo } from './typeSystem';
+import {
+    computeCompositeDefmSymbols,
+    findDefvarInStatements,
+    inferTypeFromExpression,
+} from './resolutionHelpers';
 
 // Create connection and document manager
 const connection = createConnection(ProposedFeatures.all);
@@ -323,133 +328,14 @@ function findMulticlassNode(name: string): MultiClassDef | undefined {
 }
 
 /**
- * Collect all def name suffixes produced by a multiclass.
- * Includes:
- * - direct defs in the multiclass body
- * - inherited defs from parent multiclasses
- * - nested defm-derived suffixes
- */
-function collectDefSuffixes(
-    mc: MultiClassDef,
-    cache: Map<string, Set<string>>,
-    visiting: Set<string> = new Set(),
-): Set<string> {
-    const cacheKey = mc.name.name;
-    const cached = cache.get(cacheKey);
-    if (cached) {
-        return cached;
-    }
-
-    if (visiting.has(cacheKey)) {
-        // Cycle guard for malformed recursive multiclass graphs.
-        return new Set();
-    }
-
-    visiting.add(cacheKey);
-
-    const suffixes = new Set<string>();
-
-    // Inherit suffixes from parent multiclasses first.
-    for (const parent of mc.parentClasses) {
-        const parentMc = findMulticlassNode(parent.name.name);
-        if (parentMc) {
-            for (const inherited of collectDefSuffixes(parentMc, cache, visiting)) {
-                suffixes.add(inherited);
-            }
-        }
-    }
-
-    // Then collect local body suffixes (defs, nested defm, and control-flow bodies).
-    collectDefSuffixesFromBody(mc.body, suffixes, cache, visiting);
-
-    visiting.delete(cacheKey);
-
-    // Normalize order for deterministic behavior and cache the normalized set.
-    const sortedSuffixes = new Set(Array.from(suffixes).sort());
-    cache.set(cacheKey, sortedSuffixes);
-    return sortedSuffixes;
-}
-
-function collectDefSuffixesFromBody(
-    body: Statement[],
-    suffixes: Set<string>,
-    cache: Map<string, Set<string>>,
-    visiting: Set<string>,
-): void {
-    for (const stmt of body) {
-        if (stmt.type === 'RecordDef' && stmt.name) {
-            suffixes.add(stmt.name.name);
-        } else if (stmt.type === 'DefmDef' && stmt.name) {
-            // Nested defm: composite suffix = defm_name + sub-multiclass suffixes
-            for (const parent of stmt.parentClasses) {
-                const nestedMc = findMulticlassNode(parent.name.name);
-                if (nestedMc) {
-                    for (const sub of collectDefSuffixes(nestedMc, cache, visiting)) {
-                        suffixes.add(stmt.name.name + sub);
-                    }
-                }
-            }
-        } else if (
-            stmt.type === 'DefsetDef' ||
-            stmt.type === 'ForeachStatement' ||
-            stmt.type === 'LetStatement'
-        ) {
-            collectDefSuffixesFromBody(stmt.body, suffixes, cache, visiting);
-        } else if (stmt.type === 'IfStatement') {
-            collectDefSuffixesFromBody(stmt.thenBody, suffixes, cache, visiting);
-            collectDefSuffixesFromBody(stmt.elseBody, suffixes, cache, visiting);
-        }
-    }
-}
-
-/**
  * Register composite defm symbols for a parsed file.
  * For each named defm that references a multiclass, register
  * defm_name + def_suffix as a global symbol pointing to the defm.
  */
 function registerCompositeDefmSymbols(parsed: ParsedFile, uri: string): void {
-    const suffixCache = new Map<string, Set<string>>();
-    registerCompositeDefmSymbolsFromStatements(parsed.statements, uri, suffixCache);
-}
-
-function registerCompositeDefmSymbolsFromStatements(
-    statements: Statement[],
-    uri: string,
-    suffixCache: Map<string, Set<string>>,
-): void {
-    for (const stmt of statements) {
-        if (stmt.type === 'DefmDef' && stmt.name) {
-            const defmName = stmt.name.name;
-            const defmLocation = { uri, range: stmt.name.range };
-            const compositeNames = new Set<string>();
-            for (const parent of stmt.parentClasses) {
-                const mcDef = findMulticlassNode(parent.name.name);
-                if (mcDef) {
-                    const suffixes = collectDefSuffixes(mcDef, suffixCache);
-                    for (const suffix of suffixes) {
-                        compositeNames.add(defmName + suffix);
-                    }
-                }
-            }
-
-            for (const compositeName of Array.from(compositeNames).sort()) {
-                symbolTable.addSymbol({
-                    name: compositeName,
-                    kind: 'def',
-                    location: defmLocation,
-                });
-            }
-        } else if (
-            stmt.type === 'DefsetDef' ||
-            stmt.type === 'ForeachStatement' ||
-            stmt.type === 'LetStatement'
-        ) {
-            // Recurse into bodies where defm can appear.
-            registerCompositeDefmSymbolsFromStatements(stmt.body, uri, suffixCache);
-        } else if (stmt.type === 'IfStatement') {
-            registerCompositeDefmSymbolsFromStatements(stmt.thenBody, uri, suffixCache);
-            registerCompositeDefmSymbolsFromStatements(stmt.elseBody, uri, suffixCache);
-        }
+    const symbols = computeCompositeDefmSymbols(parsed.statements, uri, findMulticlassNode);
+    for (const symbol of symbols) {
+        symbolTable.addSymbol(symbol);
     }
 }
 
@@ -1035,13 +921,6 @@ function resolveLetBindingTarget(
     return null;
 }
 
-function isSameRange(a: { start: { line: number; character: number }; end: { line: number; character: number } }, b: { start: { line: number; character: number }; end: { line: number; character: number } }): boolean {
-    return a.start.line === b.start.line &&
-        a.start.character === b.start.character &&
-        a.end.line === b.end.line &&
-        a.end.character === b.end.character;
-}
-
 function findDefvarForSymbol(symbol: Symbol): DefvarDef | undefined {
     const parsed = parsedFiles.get(symbol.location.uri);
     if (!parsed) {
@@ -1049,93 +928,6 @@ function findDefvarForSymbol(symbol: Symbol): DefvarDef | undefined {
     }
 
     return findDefvarInStatements(parsed.statements, symbol.name, symbol.location.range);
-}
-
-function findDefvarInStatements(
-    statements: Statement[],
-    defvarName: string,
-    targetRange?: { start: { line: number; character: number }; end: { line: number; character: number } }
-): DefvarDef | undefined {
-    for (const stmt of statements) {
-        switch (stmt.type) {
-            case 'DefvarDef': {
-                if (stmt.name.name !== defvarName) {
-                    break;
-                }
-                if (!targetRange || isSameRange(stmt.name.range, targetRange)) {
-                    return stmt;
-                }
-                break;
-            }
-            case 'ClassDef':
-            case 'RecordDef':
-            case 'MultiClassDef':
-            case 'DefsetDef':
-            case 'LetStatement':
-            case 'ForeachStatement': {
-                const nested = findDefvarInStatements(stmt.body, defvarName, targetRange);
-                if (nested) {
-                    return nested;
-                }
-                break;
-            }
-            case 'IfStatement': {
-                const nestedThen = findDefvarInStatements(stmt.thenBody, defvarName, targetRange);
-                if (nestedThen) {
-                    return nestedThen;
-                }
-                const nestedElse = findDefvarInStatements(stmt.elseBody, defvarName, targetRange);
-                if (nestedElse) {
-                    return nestedElse;
-                }
-                break;
-            }
-        }
-    }
-
-    return undefined;
-}
-
-function normalizeCastTypeName(typeArgText: string): string | undefined {
-    const trimmed = typeArgText.trim();
-    if (!trimmed) {
-        return undefined;
-    }
-
-    // For !cast<Foo<Bar>>(...) we need the outer type name "Foo".
-    const withoutTemplates = trimmed.split('<')[0].trim();
-    const match = withoutTemplates.match(/[A-Za-z_][A-Za-z0-9_]*/);
-    if (!match) {
-        return undefined;
-    }
-
-    return match[0];
-}
-
-function inferTypeFromExpression(
-    expr: Expression,
-    _scope: string | undefined,
-    _uri: string
-): TypeInfo | undefined {
-    if (expr.type !== 'BangOperator') {
-        return undefined;
-    }
-
-    if (expr.operator !== '!cast' || !expr.typeArgText) {
-        return undefined;
-    }
-
-    const castTypeName = normalizeCastTypeName(expr.typeArgText);
-    if (!castTypeName) {
-        return undefined;
-    }
-
-    // Only return class types that are known by the type system.
-    if (!typeSystem.getClass(castTypeName)) {
-        return undefined;
-    }
-
-    return { kind: 'class', name: castTypeName };
 }
 
 /**
@@ -1174,7 +966,10 @@ function resolveIdentifierType(name: string, scope: string | undefined, uri: str
         if (symbol.kind === 'defvar') {
             const defvarStmt = findDefvarForSymbol(symbol);
             if (defvarStmt) {
-                const inferredType = inferTypeFromExpression(defvarStmt.value, scope, uri);
+                const inferredType = inferTypeFromExpression(
+                    defvarStmt.value,
+                    (className: string) => typeSystem.getClass(className) !== undefined
+                );
                 if (inferredType) {
                     sendLog(`Resolved '${name}' via !cast to '${inferredType.name}'`);
                     return inferredType;
