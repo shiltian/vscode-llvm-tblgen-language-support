@@ -158,6 +158,7 @@ export type Expression =
 export interface NumberLiteral extends ASTNode {
   type: "NumberLiteral";
   value: number;
+  rawValue?: string;
 }
 
 export interface StringLiteral extends ASTNode {
@@ -261,6 +262,7 @@ export interface Symbol {
   location: Location;
   scope?: string; // For scoped symbols, the containing scope identifier
   isForwardDeclaration?: boolean; // For class forward declarations
+  isSynthetic?: boolean; // For generated symbols without an independent source range
 }
 
 export interface SymbolReference {

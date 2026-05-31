@@ -104,6 +104,7 @@ defm Z : B;
 
   assert.deepEqual(names, ["Z_a", "Z_b"]);
   assert.ok(symbols.every((s) => s.kind === "def"));
+  assert.ok(symbols.every((s) => s.isSynthetic));
 });
 
 test("computeCompositeDefmSymbols handles nested defm in multiclass bodies", () => {

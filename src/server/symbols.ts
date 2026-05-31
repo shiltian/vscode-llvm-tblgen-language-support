@@ -527,6 +527,7 @@ export class SymbolCollector {
       });
     }
 
+    this.currentScope = letScope;
     for (const bodyStmt of stmt.body) {
       this.collectStatement(bodyStmt);
     }
@@ -547,6 +548,7 @@ export class SymbolCollector {
 
     this.collectExpression(stmt.iterRange);
 
+    this.currentScope = foreachScope;
     for (const bodyStmt of stmt.body) {
       this.collectStatement(bodyStmt);
     }

@@ -93,6 +93,20 @@ foreach I = [1, 2] in {
 
   const iDefs = table.findAllDefinitions("I");
   assert.ok(iDefs.some((d) => d.kind === "foreachVar"));
+
+  const xRef = table
+    .findReferences("X")
+    .find((ref) => ref.scope?.startsWith("let:"));
+  assert.ok(xRef);
+  const xDef = table.findDefinition("X", xRef.scope);
+  assert.equal(xDef?.kind, "letBinding");
+
+  const iRef = table
+    .findReferences("I")
+    .find((ref) => ref.scope?.startsWith("foreach:"));
+  assert.ok(iRef);
+  const iDef = table.findDefinition("I", iRef.scope);
+  assert.equal(iDef?.kind, "foreachVar");
 });
 
 test("clearFile removes only symbols and references from that file", () => {

@@ -28,6 +28,7 @@ export class IncludeGraph {
 
   // Include lookup cache keyed by include name, including directory, and include paths.
   private includeResolutionCache: Map<string, string | undefined> = new Map();
+  private fileContentOverrides: Map<string, string> = new Map();
 
   private includeNameCacheHits = 0;
   private includeNameCacheMisses = 0;
@@ -76,6 +77,30 @@ export class IncludeGraph {
         `(include cache hits/misses: ${this.includeNameCacheHits}/${this.includeNameCacheMisses}, ` +
         `resolution hits/misses: ${this.includeResolutionCacheHits}/${this.includeResolutionCacheMisses})`,
     );
+  }
+
+  rebuild(): void {
+    this.initialize(this.rootFiles);
+  }
+
+  setFileContentOverride(filePath: string, content: string): void {
+    const normalizedPath = path.normalize(filePath);
+    this.fileContentOverrides.set(normalizedPath, content);
+    this.invalidateFile(normalizedPath);
+  }
+
+  clearFileContentOverride(filePath: string): void {
+    const normalizedPath = path.normalize(filePath);
+    this.fileContentOverrides.delete(normalizedPath);
+    this.invalidateFile(normalizedPath);
+  }
+
+  invalidateFile(filePath: string): void {
+    const normalizedPath = path.normalize(filePath);
+    this.includeNamesCache.delete(normalizedPath);
+    this.fileToRoot.clear();
+    this.visibleFilesCache.clear();
+    this.includeResolutionCache.clear();
   }
 
   /**
@@ -144,26 +169,25 @@ export class IncludeGraph {
 
     this.includeNameCacheMisses++;
 
-    if (!fs.existsSync(filePath)) {
-      this.includeNamesCache.set(normalizedPath, []);
-      return [];
-    }
-
     let content: string;
-    try {
-      content = fs.readFileSync(filePath, "utf-8");
-    } catch {
-      this.includeNamesCache.set(normalizedPath, []);
-      return [];
+    const contentOverride = this.fileContentOverrides.get(normalizedPath);
+    if (contentOverride !== undefined) {
+      content = contentOverride;
+    } else {
+      if (!fs.existsSync(filePath)) {
+        this.includeNamesCache.set(normalizedPath, []);
+        return [];
+      }
+
+      try {
+        content = fs.readFileSync(filePath, "utf-8");
+      } catch {
+        this.includeNamesCache.set(normalizedPath, []);
+        return [];
+      }
     }
 
-    const includeNames: string[] = [];
-    const includeRegex = /^\s*include\s+"([^"]+)"/gm;
-    let match;
-
-    while ((match = includeRegex.exec(content)) !== null) {
-      includeNames.push(match[1]);
-    }
+    const includeNames = extractIncludeNames(content);
 
     this.includeNamesCache.set(normalizedPath, includeNames);
     return includeNames;
@@ -376,6 +400,7 @@ export class IncludeGraph {
     this.visibleFilesCache.clear();
     this.includeNamesCache.clear();
     this.includeResolutionCache.clear();
+    this.fileContentOverrides.clear();
     this.includeNameCacheHits = 0;
     this.includeNameCacheMisses = 0;
     this.includeResolutionCacheHits = 0;
@@ -403,4 +428,74 @@ export class IncludeGraph {
 
     return Array.from(allFiles);
   }
+}
+
+export function extractIncludeNames(content: string): string[] {
+  const sanitized = stripComments(content);
+  const includeNames: string[] = [];
+  const includeRegex = /^\s*include\s+"([^"]+)"/gm;
+  let match;
+
+  while ((match = includeRegex.exec(sanitized)) !== null) {
+    includeNames.push(match[1]);
+  }
+
+  return includeNames;
+}
+
+function stripComments(content: string): string {
+  let result = "";
+  let inBlockComment = false;
+  let inString = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    const next = content[i + 1] || "";
+
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i++;
+      } else if (ch === "\n") {
+        result += "\n";
+      }
+      continue;
+    }
+
+    if (inString) {
+      result += ch;
+      if (ch === "\\") {
+        if (i + 1 < content.length) {
+          result += content[i + 1];
+          i++;
+        }
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      while (i < content.length && content[i] !== "\n") {
+        i++;
+      }
+      if (i < content.length) {
+        result += "\n";
+      }
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+
+    result += ch;
+    if (ch === '"') {
+      inString = true;
+    }
+  }
+
+  return result;
 }

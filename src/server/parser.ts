@@ -268,6 +268,19 @@ export class Lexer {
     };
   }
 
+  private readDollarIdentifier(): Token {
+    const start = this.currentPos();
+    let value = this.advance(); // $
+    while (/[a-zA-Z0-9_]/.test(this.peek())) {
+      value += this.advance();
+    }
+    return {
+      type: "identifier",
+      value,
+      range: { start, end: this.currentPos() },
+    };
+  }
+
   nextToken(): Token {
     this.skipWhitespace();
 
@@ -300,6 +313,11 @@ export class Lexer {
     // Identifier or keyword
     if (/[a-zA-Z_]/.test(ch)) {
       return this.readIdentifier();
+    }
+
+    // DAG variable name
+    if (ch === "$" && /[a-zA-Z_]/.test(this.peek(1))) {
+      return this.readDollarIdentifier();
     }
 
     // Bang operator
@@ -394,11 +412,73 @@ export class Parser {
 
   private parseIdentifier(): Identifier {
     const token = this.advance();
+    if (token.type !== "identifier") {
+      this.errors.push({
+        message: `Expected identifier, got ${token.value || token.type}`,
+        range: token.range,
+      });
+    }
     return {
       type: "Identifier",
       name: token.value,
       range: token.range,
     };
+  }
+
+  private parsePasteName(): Identifier {
+    const start = this.peek().range.start;
+    const first = this.parseIdentifier();
+    let name = first.name;
+    let end = first.range.end;
+
+    while (this.match("operator", "#")) {
+      this.advance();
+      if (!this.match("identifier")) {
+        break;
+      }
+      const next = this.parseIdentifier();
+      name += "#" + next.name;
+      end = next.range.end;
+    }
+
+    return {
+      type: "Identifier",
+      name,
+      range: { start, end },
+    };
+  }
+
+  private parseTypeTextUntilName(): string {
+    if (!this.match("keyword") && !this.match("identifier")) {
+      return "";
+    }
+
+    let typeText = this.advance().value;
+    if (this.match("punctuation", "<")) {
+      typeText += this.collectBalancedAngleText();
+    }
+
+    return typeText;
+  }
+
+  private collectBalancedAngleText(): string {
+    if (!this.match("punctuation", "<")) {
+      return "";
+    }
+
+    let text = "";
+    let depth = 0;
+    do {
+      const token = this.advance();
+      text += token.type === "string" ? `"${token.value}"` : token.value;
+      if (token.type === "punctuation" && token.value === "<") {
+        depth++;
+      } else if (token.type === "punctuation" && token.value === ">") {
+        depth--;
+      }
+    } while (depth > 0 && !this.match("eof", ""));
+
+    return text;
   }
 
   private parseTemplateArgs(): TemplateArg[] {
@@ -412,35 +492,7 @@ export class Parser {
       const startPos = this.pos; // Track position to detect infinite loops
       const start = this.peek().range.start;
 
-      // Parse type
-      let argType = "";
-      if (this.match("keyword") || this.match("identifier")) {
-        argType = this.advance().value;
-        // Handle bits<n>
-        if (argType === "bits" && this.match("punctuation", "<")) {
-          argType += "<";
-          this.advance();
-          if (this.match("number")) {
-            argType += this.advance().value;
-          }
-          if (this.match("punctuation", ">")) {
-            argType += ">";
-            this.advance();
-          }
-        }
-        // Handle list<Type>
-        if (argType === "list" && this.match("punctuation", "<")) {
-          argType += "<";
-          this.advance();
-          if (this.match("keyword") || this.match("identifier")) {
-            argType += this.advance().value;
-          }
-          if (this.match("punctuation", ">")) {
-            argType += ">";
-            this.advance();
-          }
-        }
-      }
+      const argType = this.parseTypeTextUntilName();
 
       // Parse name
       let name: Identifier | undefined;
@@ -543,6 +595,7 @@ export class Parser {
       return {
         type: "NumberLiteral",
         value: parseInt(token.value),
+        rawValue: token.value,
         range: token.range,
       };
     }
@@ -579,7 +632,7 @@ export class Parser {
 
     // Identifier or class ref
     if (token.type === "identifier") {
-      const id = this.parseIdentifier();
+      let expr: Expression = this.parseIdentifier();
 
       // Check for class instantiation (e.g., Bytecode<>)
       if (this.match("punctuation", "<")) {
@@ -597,27 +650,27 @@ export class Parser {
         if (this.match("punctuation", ">")) {
           this.advance();
         }
-        return {
+        expr = {
           type: "ClassRef",
-          name: id,
+          name: expr as Identifier,
           args,
-          range: { start: id.range.start, end: this.peek().range.start },
+          range: { start: expr.range.start, end: this.peek().range.start },
         };
       }
 
-      // Check for field access (e.g., t.cBuilder)
-      if (this.match("punctuation", ".")) {
+      // Check for chained field access (e.g., t.cBuilder.name)
+      while (this.match("punctuation", ".")) {
         this.advance();
         const field = this.parseIdentifier();
-        return {
+        expr = {
           type: "FieldAccess",
-          object: id,
+          object: expr,
           field,
-          range: { start: id.range.start, end: field.range.end },
+          range: { start: expr.range.start, end: field.range.end },
         };
       }
 
-      return id;
+      return expr;
     }
 
     // Skip unknown and return a placeholder
@@ -834,7 +887,7 @@ export class Parser {
 
     let name: Identifier | null = null;
     if (this.match("identifier")) {
-      name = this.parseIdentifier();
+      name = this.parsePasteName();
     }
 
     const parentClasses = this.parseParentClasses();
@@ -878,7 +931,7 @@ export class Parser {
 
     let name: Identifier | null = null;
     if (this.match("identifier")) {
-      name = this.parseIdentifier();
+      name = this.parsePasteName();
     }
 
     const parentClasses = this.parseParentClasses();

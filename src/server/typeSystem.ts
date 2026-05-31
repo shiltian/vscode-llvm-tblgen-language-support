@@ -123,6 +123,7 @@ export class TypeSystem {
         this.classes.delete(name);
       }
       this.fileClasses.delete(uri);
+      this.invalidateFieldCaches();
     }
   }
 
@@ -148,7 +149,13 @@ export class TypeSystem {
     this.fileClasses.get(info.uri)!.add(info.name);
 
     // Invalidate cached allFields for this class and all subclasses
-    info.allFields = undefined;
+    this.invalidateFieldCaches();
+  }
+
+  invalidateFieldCaches(): void {
+    for (const classInfo of this.classes.values()) {
+      classInfo.allFields = undefined;
+    }
   }
 
   /**

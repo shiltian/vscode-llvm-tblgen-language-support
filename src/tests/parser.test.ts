@@ -172,3 +172,78 @@ class C {
   assert.equal(cls.body[2].fieldType, "dag");
   assert.equal(cls.body[2].name.name, "Pattern");
 });
+
+test("parses DAG dollar operands and named DAG arguments", () => {
+  const parsed = parse(`
+def P : Pat<(op GPR:$src, $dst), []>;
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const def = parsed.statements[0];
+  assert.equal(def.type, "RecordDef");
+  const pat = def.parentClasses[0];
+  const dag = pat.args[0];
+  assert.equal(dag.type, "DagExpr");
+  assert.equal(dag.args.length, 2);
+  assert.equal(dag.args[0].value.type, "Identifier");
+  assert.equal(dag.args[0].value.name, "GPR");
+  assert.equal(dag.args[0].name?.name, "$src");
+  assert.equal(dag.args[1].value.type, "Identifier");
+  assert.equal(dag.args[1].value.name, "$dst");
+});
+
+test("parses paste operator names without corrupting parent classes", () => {
+  const parsed = parse("def X#Y : Base;");
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 1);
+  const def = parsed.statements[0];
+  assert.equal(def.type, "RecordDef");
+  assert.equal(def.name?.name, "X#Y");
+  assert.equal(def.parentClasses.length, 1);
+  assert.equal(def.parentClasses[0].name.name, "Base");
+});
+
+test("parses symbolic bits template argument types", () => {
+  const parsed = parse("class C<bits<N> mask>;");
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 1);
+  const cls = parsed.statements[0];
+  assert.equal(cls.type, "ClassDef");
+  assert.equal(cls.templateArgs.length, 1);
+  assert.equal(cls.templateArgs[0].argType, "bits<N>");
+  assert.equal(cls.templateArgs[0].name.name, "mask");
+});
+
+test("parses chained field access", () => {
+  const parsed = parse("defvar X = A.B.C;");
+
+  assert.equal(parsed.errors.length, 0);
+  const defvar = parsed.statements[0];
+  assert.equal(defvar.type, "DefvarDef");
+  assert.equal(defvar.value.type, "FieldAccess");
+  assert.equal(defvar.value.field.name, "C");
+  assert.equal(defvar.value.object.type, "FieldAccess");
+  assert.equal(defvar.value.object.field.name, "B");
+});
+
+test("preserves raw spelling for large integer literals", () => {
+  const parsed = parse("defvar Big = 0xFFFFFFFFFFFFFFFF;");
+
+  assert.equal(parsed.errors.length, 0);
+  const defvar = parsed.statements[0];
+  assert.equal(defvar.type, "DefvarDef");
+  assert.equal(defvar.value.type, "NumberLiteral");
+  assert.equal(defvar.value.rawValue, "0xFFFFFFFFFFFFFFFF");
+});
+
+test("reports parse errors for missing identifiers", () => {
+  const parsed = parse("class {");
+
+  assert.ok(
+    parsed.errors.some((error) =>
+      error.message.includes("Expected identifier"),
+    ),
+  );
+});

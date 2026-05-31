@@ -4,7 +4,6 @@ import {
   ProposedFeatures,
   InitializeParams,
   InitializeResult,
-  TextDocumentSyncKind,
   DefinitionParams,
   Location,
   RenameParams,
@@ -18,6 +17,8 @@ import {
   PrepareRenameParams,
   HoverParams,
   Hover,
+  DidChangeWatchedFilesParams,
+  FileChangeType,
 } from "vscode-languageserver/node";
 
 import { TextDocument } from "vscode-languageserver-textdocument";
@@ -43,6 +44,14 @@ import {
   findDefvarInStatements,
   inferTypeFromExpression,
 } from "./resolutionHelpers";
+import { filePathToUri, uriToFilePath } from "./pathUtils";
+import {
+  addDeduplicatedTextEdit,
+  buildInitializeResult,
+  parseErrorsToDiagnostics,
+  shouldIncludeRenameReference,
+  shouldIncludeRenameSymbol,
+} from "./lspHelpers";
 
 // Create connection and document manager
 const connection = createConnection(ProposedFeatures.all);
@@ -95,36 +104,18 @@ function formatElapsed(startTime: number): string {
   return `${Date.now() - startTime}ms`;
 }
 
-function filePathToUri(filePath: string): string {
-  return "file://" + filePath;
-}
-
-function uriToFilePath(uri: string): string {
-  return uri.replace("file://", "");
-}
-
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   workspaceFolders =
-    params.workspaceFolders?.map((f) => f.uri.replace("file://", "")) || [];
+    params.workspaceFolders?.map((f) => uriToFilePath(f.uri)) || [];
 
   sendLog("TableGen Language Server initializing...");
   sendLog(`Workspace folders: ${workspaceFolders.join(", ")}`);
 
-  return {
-    capabilities: {
-      textDocumentSync: TextDocumentSyncKind.Incremental,
-      definitionProvider: true,
-      renameProvider: {
-        prepareProvider: true,
-      },
-      documentSymbolProvider: true,
-      hoverProvider: true,
-    },
-  };
+  return buildInitializeResult();
 });
 
 connection.onInitialized(async () => {
@@ -374,6 +365,7 @@ function parseAndIndexText(
   const parsed = parseTableGen(content, uri);
   parsedFiles.set(uri, parsed);
   updateMulticlassIndex(uri, parsed);
+  publishDiagnostics(uri, parsed);
 
   // Collect symbols
   symbolTable.clearFile(uri);
@@ -395,6 +387,13 @@ function parseAndIndexText(
   }
 
   return parsed;
+}
+
+function publishDiagnostics(uri: string, parsed: ParsedFile): void {
+  connection.sendDiagnostics({
+    uri,
+    diagnostics: parseErrorsToDiagnostics(parsed.errors),
+  });
 }
 
 /**
@@ -494,12 +493,63 @@ connection.onRequest("tablegen/reindex", async () => {
   return { success: true };
 });
 
+function clearIndexedFile(uri: string): void {
+  symbolTable.clearFile(uri);
+  typeSystem.clearFile(uri);
+  parsedFiles.delete(uri);
+  updateMulticlassIndex(uri, {
+    uri,
+    statements: [],
+    includes: [],
+    errors: [],
+  });
+  indexedFiles.delete(path.normalize(uriToFilePath(uri)));
+}
+
+connection.onDidChangeWatchedFiles((params: DidChangeWatchedFilesParams) => {
+  let shouldRebuildGraph = false;
+
+  for (const change of params.changes) {
+    const filePath = path.normalize(uriToFilePath(change.uri));
+    includeGraph.clearFileContentOverride(filePath);
+    includeGraph.invalidateFile(filePath);
+    clearIndexedFile(change.uri);
+
+    if (
+      change.type === FileChangeType.Changed ||
+      change.type === FileChangeType.Created ||
+      change.type === FileChangeType.Deleted
+    ) {
+      shouldRebuildGraph = true;
+    }
+  }
+
+  if (shouldRebuildGraph) {
+    includeGraph.rebuild();
+    indexedFiles.clear();
+  }
+});
+
 function parseAndIndexDocument(
   document: TextDocument,
   options: { registerCompositeSymbols?: boolean } = {},
 ): ParsedFile {
+  const oldIncludes = parsedFiles
+    .get(document.uri)
+    ?.includes.map((include) => include.path)
+    .join("\0");
   const parsed = parseAndIndexText(document.uri, document.getText(), options);
-  indexedFiles.add(path.normalize(uriToFilePath(document.uri)));
+  const filePath = path.normalize(uriToFilePath(document.uri));
+  indexedFiles.add(filePath);
+
+  const newIncludes = parsed.includes.map((include) => include.path).join("\0");
+  includeGraph.setFileContentOverride(filePath, document.getText());
+  if (oldIncludes !== newIncludes) {
+    includeGraph.rebuild();
+    indexedFiles.clear();
+    indexedFiles.add(filePath);
+  }
+
   return parsed;
 }
 
@@ -537,6 +587,9 @@ function flushPendingDocumentParses(): void {
 // Document change handlers
 documents.onDidOpen(async (event) => {
   const filePath = uriToFilePath(event.document.uri);
+  includeGraph.setFileContentOverride(filePath, event.document.getText());
+  includeGraph.rebuild();
+  indexedFiles.clear();
   await ensureFilesIndexed(filePath);
 });
 
@@ -546,6 +599,7 @@ documents.onDidChangeContent((event) => {
 
 documents.onDidClose((event) => {
   flushPendingDocumentParse(event.document.uri);
+  connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
   // Keep parsed data for cross-file references
 });
 
@@ -647,14 +701,9 @@ connection.onDefinition(
     }
 
     // Try scoped lookup (for template args, local variables, etc.)
-    // But skip letBinding since let is never a definition
     if (symbolScope) {
       const def = symbolTable.findDefinition(symbolName, symbolScope);
-      if (
-        def &&
-        def.kind !== "letBinding" &&
-        visibleUris.has(def.location.uri)
-      ) {
+      if (def && visibleUris.has(def.location.uri)) {
         sendLog(
           `Found scoped definition (${def.kind}) in ${path.basename(def.location.uri)}`,
         );
@@ -666,7 +715,7 @@ connection.onDefinition(
     }
 
     // Global lookup - but be careful about what we return
-    // - letBinding: never a definition (it's an override)
+    // - letBinding: only valid in scoped lookup above
     // - field: only valid if we're not in a class scope (otherwise it should have been found via type system)
     // - class, def, defm, multiclass, defset, defvar: these are valid global definitions
     const allDefs = symbolTable.findAllDefinitions(symbolName);
@@ -680,7 +729,7 @@ connection.onDefinition(
         containingScope.startsWith("multiclass:"));
 
     const validDefs = allDefs.filter((d) => {
-      // Never return letBinding
+      // Never return letBinding from broad global lookup
       if (d.kind === "letBinding") return false;
       // If we're in a class scope, don't return random fields from other classes
       // They should have been found via type system lookup
@@ -1240,6 +1289,13 @@ connection.onRenameRequest(
 
     const word = getWordAtPosition(doc, params.position);
     if (!word) return null;
+    const symbolInfo = symbolTable.getSymbolAtPosition(
+      uri,
+      params.position.line,
+      params.position.character,
+    );
+    const activeScope =
+      symbolInfo?.name === word ? symbolInfo.scope : undefined;
 
     // Get visible files for scope
     const visibleFiles = includeGraph.getVisibleFiles(filePath);
@@ -1251,28 +1307,26 @@ connection.onRenameRequest(
     // Find all definitions in visible files
     const defs = symbolTable.findAllDefinitions(word);
     for (const def of defs) {
-      if (visibleUris.has(def.location.uri)) {
-        if (!changes[def.location.uri]) {
-          changes[def.location.uri] = [];
-        }
-        changes[def.location.uri].push({
-          range: def.location.range,
-          newText: newName,
-        });
+      if (shouldIncludeRenameSymbol(def, activeScope, visibleUris)) {
+        addDeduplicatedTextEdit(
+          changes,
+          def.location.uri,
+          def.location.range,
+          newName,
+        );
       }
     }
 
     // Find all references in visible files
     const refs = symbolTable.findReferences(word);
     for (const ref of refs) {
-      if (visibleUris.has(ref.location.uri)) {
-        if (!changes[ref.location.uri]) {
-          changes[ref.location.uri] = [];
-        }
-        changes[ref.location.uri].push({
-          range: ref.location.range,
-          newText: newName,
-        });
+      if (shouldIncludeRenameReference(ref, activeScope, visibleUris)) {
+        addDeduplicatedTextEdit(
+          changes,
+          ref.location.uri,
+          ref.location.range,
+          newName,
+        );
       }
     }
 

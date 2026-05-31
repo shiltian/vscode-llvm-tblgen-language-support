@@ -254,6 +254,7 @@ function collectCompositeDefmSymbolsFromStatements(
           name: compositeName,
           kind: "def",
           location: defmLocation,
+          isSynthetic: true,
         });
       }
     } else if (

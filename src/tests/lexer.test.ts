@@ -49,3 +49,12 @@ test("tokenizes string and code block literals", () => {
   assert.ok(codeToken);
   assert.equal(codeToken.value.trim(), "code body");
 });
+
+test("tokenizes DAG dollar variable names", () => {
+  const tokens = tokenize("$src GPR:$dst");
+  const identifiers = tokens
+    .filter((t) => t.type === "identifier")
+    .map((t) => t.value);
+
+  assert.deepEqual(identifiers, ["$src", "GPR", "$dst"]);
+});

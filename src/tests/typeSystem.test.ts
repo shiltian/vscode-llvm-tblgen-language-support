@@ -365,3 +365,66 @@ test("clearFile removes classes from that uri", () => {
   assert.equal(typeSystem.getClass("A"), undefined);
   assert.ok(typeSystem.getClass("B"));
 });
+
+test("clearFile invalidates inherited field caches in other files", () => {
+  const typeSystem = new TypeSystem();
+  const baseUri = "file:///base.td";
+  const childUri = "file:///child.td";
+
+  addClass(typeSystem, {
+    name: "Base",
+    kind: "class",
+    location: {
+      uri: baseUri,
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 4 },
+      },
+    },
+    uri: baseUri,
+    parentClasses: [],
+    arguments: [],
+    fields: new Map([["Old", field("Old", baseUri, 1)]]),
+    isForwardDeclaration: false,
+  });
+  addClass(typeSystem, {
+    name: "Child",
+    kind: "class",
+    location: {
+      uri: childUri,
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 5 },
+      },
+    },
+    uri: childUri,
+    parentClasses: ["Base"],
+    arguments: [],
+    fields: new Map(),
+    isForwardDeclaration: false,
+  });
+
+  assert.ok(typeSystem.getAllFields("Child").has("Old"));
+
+  typeSystem.clearFile(baseUri);
+  addClass(typeSystem, {
+    name: "Base",
+    kind: "class",
+    location: {
+      uri: baseUri,
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 4 },
+      },
+    },
+    uri: baseUri,
+    parentClasses: [],
+    arguments: [],
+    fields: new Map([["New", field("New", baseUri, 2)]]),
+    isForwardDeclaration: false,
+  });
+
+  const fields = typeSystem.getAllFields("Child");
+  assert.equal(fields.has("Old"), false);
+  assert.equal(fields.has("New"), true);
+});
