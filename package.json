@@ -19,7 +19,10 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:tablegen"
+    "onLanguage:tablegen",
+    "onCommand:tablegen.restartServer",
+    "onCommand:tablegen.reindex",
+    "onCommand:tablegen.showOutput"
   ],
   "main": "./out/extension.js",
   "contributes": {
