@@ -444,10 +444,16 @@ export class Parser {
     while (this.match("operator", "#")) {
       this.advance();
       if (
-        !this.match("identifier") &&
-        !this.match("string") &&
-        !this.match("number")
+        !this.isNamePartStart(this.peek()) &&
+        !this.isObjectNameTerminator(this.peek())
       ) {
+        break;
+      }
+      if (this.isObjectNameTerminator(this.peek())) {
+        // LLVM allows a trailing paste before the object body. Preserve it as
+        // source spelling but stop before consuming the body token.
+        name += "#";
+        end = this.previousTokenEnd();
         break;
       }
       const next = this.parseNamePart();
@@ -462,6 +468,25 @@ export class Parser {
     };
   }
 
+  private isNamePartStart(token: Token): boolean {
+    return (
+      token.type === "identifier" ||
+      token.type === "string" ||
+      token.type === "number" ||
+      (token.type === "operator" && token.value.startsWith("!")) ||
+      (token.type === "punctuation" &&
+        (token.value === "(" || token.value === "[" || token.value === "?"))
+    );
+  }
+
+  private isObjectNameTerminator(token: Token): boolean {
+    return (
+      token.type === "eof" ||
+      (token.type === "punctuation" &&
+        (token.value === ":" || token.value === ";" || token.value === "{"))
+    );
+  }
+
   private parseNamePart(): Identifier {
     const token = this.advance();
     let name =
@@ -472,9 +497,31 @@ export class Parser {
           : token.value;
     let end = token.range.end;
 
-    while (this.match("punctuation", "[")) {
-      name += this.collectBalancedBracketText("[", "]");
-      end = this.previousTokenEnd();
+    while (true) {
+      if (this.match("punctuation", ".")) {
+        this.advance();
+        if (!this.match("identifier")) {
+          break;
+        }
+        const field = this.parseIdentifier();
+        name += "." + field.name;
+        end = field.range.end;
+        continue;
+      }
+
+      if (this.match("punctuation", "[")) {
+        name += this.collectBalancedBracketText("[", "]");
+        end = this.previousTokenEnd();
+        continue;
+      }
+
+      if (this.match("punctuation", "{")) {
+        name += this.collectBalancedBracketText("{", "}");
+        end = this.previousTokenEnd();
+        continue;
+      }
+
+      break;
     }
 
     return {
@@ -1062,7 +1109,7 @@ export class Parser {
     this.advance(); // def
 
     let name: Identifier | null = null;
-    if (this.match("identifier") || this.match("string")) {
+    if (this.isNamePartStart(this.peek())) {
       name = this.parsePasteName();
     }
 
@@ -1106,7 +1153,7 @@ export class Parser {
     this.advance(); // defm
 
     let name: Identifier | null = null;
-    if (this.match("identifier") || this.match("string")) {
+    if (this.isNamePartStart(this.peek())) {
       name = this.parsePasteName();
     }
 
@@ -1224,7 +1271,8 @@ export class Parser {
 
     while (this.match("identifier")) {
       const bindingStart = this.peek().range.start;
-      const name = this.parseIdentifier();
+      const { name, mode } = this.parseLetBindingName();
+      const bitRangeText = this.collectOptionalBitRangeText();
 
       if (this.match("punctuation", "=")) {
         this.advance();
@@ -1236,6 +1284,8 @@ export class Parser {
         type: "LetBinding",
         name,
         value,
+        mode,
+        bitRangeText,
         range: { start: bindingStart, end: this.peek().range.start },
       });
 
@@ -1270,6 +1320,30 @@ export class Parser {
       body,
       range: { start, end: this.peek().range.start },
     };
+  }
+
+  private parseLetBindingName(): {
+    name: Identifier;
+    mode?: "append" | "prepend";
+  } {
+    if (
+      (this.peek().value === "append" || this.peek().value === "prepend") &&
+      this.peek(1).type === "identifier"
+    ) {
+      const mode = this.advance().value as "append" | "prepend";
+      return { name: this.parseIdentifier(), mode };
+    }
+
+    return { name: this.parseIdentifier() };
+  }
+
+  private collectOptionalBitRangeText(): string | undefined {
+    if (!this.match("punctuation", "{")) {
+      return undefined;
+    }
+
+    const text = this.collectBalancedBracketText("{", "}");
+    return text.length > 0 ? text : undefined;
   }
 
   private parseForeach(): ForeachStatement {

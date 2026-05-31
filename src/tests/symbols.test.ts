@@ -245,3 +245,24 @@ class Profile<VOPProfile P> {
   assert.ok(table.findReferences("P").length > 0);
   assert.ok(table.findReferences("v4bf16").length > 0);
 });
+
+test("LLVM value suffix expressions collect useful references", () => {
+  const table = collectSymbols(`
+class C<Profile P> {
+  bit A = P.ArgVT[0].IsFP;
+  bit B = matrix_a_fmt{0};
+  string S = "prefix" # P.Name # "_suffix";
+}
+let append Predicates = [HasFoo] in def D : Base;
+`);
+
+  assert.ok(table.findDefinition("A", "class:C"));
+  assert.ok(table.findDefinition("B", "class:C"));
+  assert.ok(table.findDefinition("S", "class:C"));
+  assert.ok(
+    table.findAllDefinitions("Predicates").some((d) => d.kind === "letBinding"),
+  );
+  for (const name of ["P", "ArgVT", "IsFP", "matrix_a_fmt", "HasFoo"]) {
+    assert.ok(table.findReferences(name).length > 0, name);
+  }
+});

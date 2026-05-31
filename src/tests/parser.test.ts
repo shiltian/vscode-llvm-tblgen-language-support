@@ -292,6 +292,29 @@ foreach Type = ["I", "U"] in {
   assert.equal(secondForeach.body[1].name?.name, '"_mac_e64"');
 });
 
+test("parses LLVM value-like generated names with dotted suffixes", () => {
+  const parsed = parse(`
+multiclass M<GFXGen Gen> {
+  def Gen.Suffix : Base<Gen>;
+  def _dpp#Gen.Suffix : DPPBase<Gen.Subtarget>;
+  def _dpp8#Gen.Suffix : DPP8Base;
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 1);
+  const multiclass = parsed.statements[0];
+  assert.equal(multiclass.type, "MultiClassDef");
+  assert.equal(multiclass.body.length, 3);
+  assert.equal(multiclass.body[0].type, "RecordDef");
+  assert.equal(multiclass.body[0].name?.name, "Gen.Suffix");
+  assert.equal(multiclass.body[1].type, "RecordDef");
+  assert.equal(multiclass.body[1].name?.name, "_dpp#Gen.Suffix");
+  assert.equal(multiclass.body[1].parentClasses[0].args.length, 1);
+  assert.equal(multiclass.body[2].type, "RecordDef");
+  assert.equal(multiclass.body[2].name?.name, "_dpp8#Gen.Suffix");
+});
+
 test("parses bang operators in class and template arguments", () => {
   const parsed = parse(`
 def Type#Index#"_8bit" : Extract<!shl(Index, 3), 255, !eq(Type, "U")>;
@@ -316,6 +339,73 @@ let PostEncoderMethod = !if(!and(Pfl.HasSrc0, Pfl.HasSrc1, Pfl.HasSrc2), "", "po
   assert.equal(parsed.errors.length, 0);
   assert.equal(parsed.statements.length, 1);
   assert.equal(parsed.statements[0].type, "LetStatement");
+});
+
+test("parses LLVM value suffix forms in field initializers", () => {
+  const parsed = parse(`
+class C<Profile P> {
+  bit A = P.ArgVT[0].IsFP;
+  bit B = matrix_a_fmt{0};
+  string S = "prefix" # P.Name # "_suffix";
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const cls = parsed.statements[0];
+  assert.equal(cls.type, "ClassDef");
+  assert.equal(cls.body.length, 3);
+  assert.equal(cls.body[0].type, "FieldDef");
+  assert.equal(cls.body[0].name.name, "A");
+  assert.equal(cls.body[1].type, "FieldDef");
+  assert.equal(cls.body[1].name.name, "B");
+  assert.equal(cls.body[2].type, "FieldDef");
+  assert.equal(cls.body[2].name.name, "S");
+});
+
+test("parses let bit ranges and append/prepend modes", () => {
+  const parsed = parse(`
+class Enc {
+  let Inst{11} = Flag;
+  let Inst{15-12} = Opcode;
+}
+let append Predicates = [HasFoo] in def D : Base;
+let prepend OtherPredicates = [HasBar] in def E : Base;
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const cls = parsed.statements[0];
+  assert.equal(cls.type, "ClassDef");
+  assert.equal(cls.body[0].type, "LetStatement");
+  assert.equal(cls.body[0].bindings[0].name.name, "Inst");
+  assert.equal(cls.body[0].bindings[0].bitRangeText, "{11}");
+  assert.equal(cls.body[1].type, "LetStatement");
+  assert.equal(cls.body[1].bindings[0].bitRangeText, "{15-12}");
+
+  const appendLet = parsed.statements[1];
+  assert.equal(appendLet.type, "LetStatement");
+  assert.equal(appendLet.bindings[0].mode, "append");
+  assert.equal(appendLet.bindings[0].name.name, "Predicates");
+  assert.equal(appendLet.body[0].type, "RecordDef");
+
+  const prependLet = parsed.statements[2];
+  assert.equal(prependLet.type, "LetStatement");
+  assert.equal(prependLet.bindings[0].mode, "prepend");
+  assert.equal(prependLet.bindings[0].name.name, "OtherPredicates");
+  assert.equal(prependLet.body[0].type, "RecordDef");
+});
+
+test("parses common LLVM bang operator shapes", () => {
+  const parsed = parse(`
+class C<int N = !cond(!eq(A, B) : 1, true : 0)>;
+defvar R = !range(0, 8, 2);
+defvar L = !foreach(I, [0, 1], I # "x");
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 3);
+  assert.equal(parsed.statements[0].type, "ClassDef");
+  assert.equal(parsed.statements[1].type, "DefvarDef");
+  assert.equal(parsed.statements[2].type, "DefvarDef");
 });
 
 test("parses foreach ranges and indexed field expressions", () => {

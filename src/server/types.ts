@@ -110,6 +110,8 @@ export interface LetBinding extends ASTNode {
   type: "LetBinding";
   name: Identifier;
   value: Expression;
+  mode?: "append" | "prepend";
+  bitRangeText?: string;
 }
 
 // Foreach statement
