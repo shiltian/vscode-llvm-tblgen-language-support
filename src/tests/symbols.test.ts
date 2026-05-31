@@ -204,3 +204,44 @@ test("importData rebuilds name and position lookup indexes", () => {
   assert.equal(restored.getSymbolAtPosition(uri, 3, 3)?.name, "Imported");
   assert.equal(restored.getSymbolAtPosition(uri, 5, 5)?.name, "Imported");
 });
+
+test("complex pattern expressions collect useful references", () => {
+  const table = collectSymbols(`
+def : GCNPat<
+  (ThreeOpFrag<frag, add> v2i64:$src0, v2i64:$src1, v2i64:$src2),
+  (Inst VSrc:$src0, (i32 (EXTRACT_SUBREG $src1, sub0)), VSrc:$src2)
+>;
+`);
+
+  for (const name of [
+    "GCNPat",
+    "ThreeOpFrag",
+    "Inst",
+    "VSrc",
+    "EXTRACT_SUBREG",
+  ]) {
+    assert.ok(table.findReferences(name).length > 0, name);
+  }
+});
+
+test("generated names and indexed bang args collect symbols and references", () => {
+  const table = collectSymbols(`
+foreach Type = ["I", "U"] in
+  foreach Index = 0-3 in
+    def Type#Index#"_8bit" : Extract<!shl(Index, 3), 255, !eq(Type, "U")>;
+class Profile<VOPProfile P> {
+  bit HasClamp = !if(!eq(P.ArgVT[0], v4bf16), 0, 1);
+}
+`);
+
+  assert.ok(table.findDefinition('Type#Index#"_8bit"'));
+  assert.ok(
+    table.findAllDefinitions("Index").some((d) => d.kind === "foreachVar"),
+  );
+  assert.ok(table.findDefinition("HasClamp", "class:Profile"));
+  assert.ok(table.findReferences("Extract").length > 0);
+  assert.ok(table.findReferences("Index").length > 0);
+  assert.ok(table.findReferences("Type").length > 0);
+  assert.ok(table.findReferences("P").length > 0);
+  assert.ok(table.findReferences("v4bf16").length > 0);
+});

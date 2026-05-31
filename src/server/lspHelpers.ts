@@ -78,6 +78,21 @@ export function shouldIncludeRenameReference(
   return shouldIncludeScope(ref.scope, activeScope);
 }
 
+export function shouldIncludeDocumentSymbol(symbol: Symbol): boolean {
+  if (symbol.scope || !symbol.name || symbol.isSynthetic) {
+    return false;
+  }
+
+  return (
+    symbol.kind === "class" ||
+    symbol.kind === "def" ||
+    symbol.kind === "defm" ||
+    symbol.kind === "multiclass" ||
+    symbol.kind === "defset" ||
+    symbol.kind === "defvar"
+  );
+}
+
 function shouldIncludeScope(
   candidateScope: string | undefined,
   activeScope: string | undefined,

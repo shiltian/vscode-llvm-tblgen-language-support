@@ -7,6 +7,7 @@ import {
   addDeduplicatedTextEdit,
   buildInitializeResult,
   parseErrorsToDiagnostics,
+  shouldIncludeDocumentSymbol,
   shouldIncludeRenameSymbol,
 } from "../server/lspHelpers";
 import { filePathToUri, uriToFilePath } from "../server/pathUtils";
@@ -95,4 +96,26 @@ test("rename helper narrows scoped symbols", () => {
     shouldIncludeRenameSymbol(otherLocalSymbol, "let:1:0", visibleUris),
     false,
   );
+});
+
+test("document symbol helper keeps only real top-level declarations", () => {
+  const uri = "file:///outline.td";
+  const make = (
+    name: string,
+    kind: Symbol["kind"],
+    scope?: string,
+  ): Symbol => ({
+    name,
+    kind,
+    location: { uri, range },
+    scope,
+  });
+
+  assert.equal(shouldIncludeDocumentSymbol(make("C", "class")), true);
+  assert.equal(shouldIncludeDocumentSymbol(make("D", "def")), true);
+  assert.equal(
+    shouldIncludeDocumentSymbol(make("InnerField", "field", "class:C")),
+    false,
+  );
+  assert.equal(shouldIncludeDocumentSymbol(make("Flag", "letBinding")), false);
 });

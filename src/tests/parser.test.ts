@@ -247,3 +247,126 @@ test("reports parse errors for missing identifiers", () => {
     ),
   );
 });
+
+test("recovers complex pattern DAG expressions in anonymous defs", () => {
+  const parsed = parse(`
+def : GCNPat<
+  (ThreeOpFrag<frag, add> v2i64:$src0, v2i64:$src1, v2i64:$src2),
+  (Inst VSrc:$src0, (i32 (EXTRACT_SUBREG $src1, sub0)), VSrc:$src2)
+>;
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 1);
+  const def = parsed.statements[0];
+  assert.equal(def.type, "RecordDef");
+  assert.equal(def.name, null);
+  assert.equal(def.parentClasses.length, 1);
+  assert.equal(def.parentClasses[0].name.name, "GCNPat");
+  assert.equal(def.parentClasses[0].args.length, 2);
+});
+
+test("parses generated TableGen def names", () => {
+  const parsed = parse(`
+foreach Idx = [[0,28],[4,24]] in
+  def ExtractSigned4bit_#Idx[0] : PatFrag<(ops node:$src), (sra node:$src, (i32 28))>;
+foreach Type = ["I", "U"] in {
+  def Type#0#"_8bit" : Base;
+  def "_mac_e64" : Base;
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 2);
+  const firstForeach = parsed.statements[0];
+  assert.equal(firstForeach.type, "ForeachStatement");
+  const generated = firstForeach.body[0];
+  assert.equal(generated.type, "RecordDef");
+  assert.equal(generated.name?.name, "ExtractSigned4bit_#Idx[0]");
+
+  const secondForeach = parsed.statements[1];
+  assert.equal(secondForeach.type, "ForeachStatement");
+  assert.equal(secondForeach.body[0].type, "RecordDef");
+  assert.equal(secondForeach.body[0].name?.name, 'Type#0#"_8bit"');
+  assert.equal(secondForeach.body[1].type, "RecordDef");
+  assert.equal(secondForeach.body[1].name?.name, '"_mac_e64"');
+});
+
+test("parses bang operators in class and template arguments", () => {
+  const parsed = parse(`
+def Type#Index#"_8bit" : Extract<!shl(Index, 3), 255, !eq(Type, "U")>;
+class C<int N = !if(!eq(N, 0), 1, !shl(N, 1))>;
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const def = parsed.statements[0];
+  assert.equal(def.type, "RecordDef");
+  assert.equal(def.parentClasses[0].name.name, "Extract");
+  assert.equal(def.parentClasses[0].args.length, 3);
+  const cls = parsed.statements[1];
+  assert.equal(cls.type, "ClassDef");
+  assert.equal(cls.templateArgs[0].defaultValue?.type, "BangOperator");
+});
+
+test("does not treat delimiter-looking strings as expression delimiters", () => {
+  const parsed = parse(`
+let PostEncoderMethod = !if(!and(Pfl.HasSrc0, Pfl.HasSrc1, Pfl.HasSrc2), "", "postEncodeVOP3<"#Pfl.HasSrc0#","#Pfl.HasSrc1#","#Pfl.HasSrc2#">");
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 1);
+  assert.equal(parsed.statements[0].type, "LetStatement");
+});
+
+test("parses foreach ranges and indexed field expressions", () => {
+  const parsed = parse(`
+foreach Index = 0-3 in {
+  def Item#Index : Base<Index>;
+}
+class Profile<VOPProfile P> {
+  bit HasClamp = !if(!eq(P.ArgVT[0], v4bf16), 0, 1);
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 2);
+  const foreachStmt = parsed.statements[0];
+  assert.equal(foreachStmt.type, "ForeachStatement");
+  assert.equal(foreachStmt.iterRange.type, "RawExpr");
+  assert.equal(foreachStmt.body[0].type, "RecordDef");
+  assert.equal(foreachStmt.body[0].name?.name, "Item#Index");
+
+  const cls = parsed.statements[1];
+  assert.equal(cls.type, "ClassDef");
+  assert.equal(cls.body[0].type, "FieldDef");
+  assert.equal(cls.body[0].name.name, "HasClamp");
+});
+
+test("suppresses cascaded diagnostics for balanced unsupported expressions", () => {
+  const parsed = parse(`
+class Good<int N = !unsupported((A, B), [C, D])>;
+class {
+`);
+
+  assert.equal(parsed.errors.length, 1);
+  assert.match(parsed.errors[0].message, /Expected identifier/);
+});
+
+test("parses compact synthetic real-world smoke fixture", () => {
+  const parsed = parse(`
+class PatFrag<dag ops, dag frag>;
+class Extract<int FromBitIndex, int BitMask, bit U>;
+class Pseudo<string OpName, dag Pattern>;
+class VOPProfile<bit HasMods>;
+def null_frag;
+multiclass Insts<string OpName, VOPProfile P> {
+  def NAME : Pseudo<OpName, !if(P.HasMods, PatFrag<(ops node:$src), (op node:$src)>, null_frag)>;
+}
+foreach Type = ["I", "U"] in
+  foreach Index = 0-3 in
+    def Type#Index#"_8bit" : Extract<!shl(Index, 3), 255, !eq(Type, "U")>;
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 7);
+});

@@ -49,6 +49,7 @@ import {
   addDeduplicatedTextEdit,
   buildInitializeResult,
   parseErrorsToDiagnostics,
+  shouldIncludeDocumentSymbol,
   shouldIncludeRenameReference,
   shouldIncludeRenameSymbol,
 } from "./lspHelpers";
@@ -1348,16 +1349,14 @@ connection.onDocumentSymbol(
 
     const symbols = symbolTable.getAllSymbolsInFile(uri);
 
-    return symbols
-      .filter((s) => !s.scope && s.name) // Filter out scoped symbols AND symbols with empty names
-      .map((s) => ({
-        name: s.name,
-        kind: symbolKindToLSP(s.kind),
-        location: {
-          uri: s.location.uri,
-          range: s.location.range,
-        },
-      }));
+    return symbols.filter(shouldIncludeDocumentSymbol).map((s) => ({
+      name: s.name,
+      kind: symbolKindToLSP(s.kind),
+      location: {
+        uri: s.location.uri,
+        range: s.location.range,
+      },
+    }));
   },
 );
 

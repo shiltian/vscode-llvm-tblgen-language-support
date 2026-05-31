@@ -21,6 +21,7 @@ import {
   ParsedFile,
   ParseError,
   LetBinding,
+  RawExpr,
 } from "./types";
 
 // Token types
@@ -344,6 +345,15 @@ export class Lexer {
       };
     }
 
+    if (ch === "-") {
+      this.advance();
+      return {
+        type: "operator",
+        value: "-",
+        range: { start, end: this.currentPos() },
+      };
+    }
+
     // Punctuation
     const punctuation = "{}[]()<>:;,=.";
     if (punctuation.includes(ch)) {
@@ -427,16 +437,20 @@ export class Parser {
 
   private parsePasteName(): Identifier {
     const start = this.peek().range.start;
-    const first = this.parseIdentifier();
+    const first = this.parseNamePart();
     let name = first.name;
     let end = first.range.end;
 
     while (this.match("operator", "#")) {
       this.advance();
-      if (!this.match("identifier")) {
+      if (
+        !this.match("identifier") &&
+        !this.match("string") &&
+        !this.match("number")
+      ) {
         break;
       }
-      const next = this.parseIdentifier();
+      const next = this.parseNamePart();
       name += "#" + next.name;
       end = next.range.end;
     }
@@ -446,6 +460,56 @@ export class Parser {
       name,
       range: { start, end },
     };
+  }
+
+  private parseNamePart(): Identifier {
+    const token = this.advance();
+    let name =
+      token.type === "string"
+        ? `"${token.value}"`
+        : token.type === "number"
+          ? token.value
+          : token.value;
+    let end = token.range.end;
+
+    while (this.match("punctuation", "[")) {
+      name += this.collectBalancedBracketText("[", "]");
+      end = this.previousTokenEnd();
+    }
+
+    return {
+      type: "Identifier",
+      name,
+      range: { start: token.range.start, end },
+    };
+  }
+
+  private previousTokenEnd(): Position {
+    return this.tokens[Math.max(0, this.pos - 1)].range.end;
+  }
+
+  private collectBalancedBracketText(open: string, close: string): string {
+    if (!this.match("punctuation", open)) {
+      return "";
+    }
+
+    let text = "";
+    let depth = 0;
+    do {
+      const token = this.advance();
+      text += this.tokenText(token);
+      if (token.type === "punctuation" && token.value === open) {
+        depth++;
+      } else if (token.type === "punctuation" && token.value === close) {
+        depth--;
+      }
+    } while (depth > 0 && !this.match("eof", ""));
+
+    return text;
+  }
+
+  private tokenText(token: Token): string {
+    return token.type === "string" ? `"${token.value}"` : token.value;
   }
 
   private parseTypeTextUntilName(): string {
@@ -504,7 +568,7 @@ export class Parser {
       let defaultValue: Expression | undefined;
       if (this.match("punctuation", "=")) {
         this.advance();
-        defaultValue = this.parseExpression();
+        defaultValue = this.parseDelimitedExpression(new Set([",", ">"]));
       }
 
       if (name) {
@@ -540,7 +604,7 @@ export class Parser {
     if (this.match("punctuation", "<")) {
       this.advance();
       while (!this.match("punctuation", ">") && !this.match("eof", "")) {
-        args.push(this.parseExpression());
+        args.push(this.parseDelimitedExpression(new Set([",", ">"])));
         if (this.match("punctuation", ",")) {
           this.advance();
         }
@@ -575,6 +639,118 @@ export class Parser {
     }
 
     return parents;
+  }
+
+  private parseDelimitedExpression(delimiters: Set<string>): Expression {
+    const startPos = this.pos;
+    const expr = this.parseExpression();
+
+    if (
+      this.isExpressionDelimiter(this.peek(), delimiters) ||
+      this.match("eof", "") ||
+      this.pos === startPos
+    ) {
+      return expr;
+    }
+
+    this.pos = startPos;
+    return this.parseRawExpressionUntil((token, state) => {
+      return (
+        state.angleDepth === 0 &&
+        state.parenDepth === 0 &&
+        state.bracketDepth === 0 &&
+        state.braceDepth === 0 &&
+        this.isExpressionDelimiter(token, delimiters)
+      );
+    });
+  }
+
+  private isExpressionDelimiter(
+    token: Token,
+    delimiters: Set<string>,
+  ): boolean {
+    if (token.type !== "punctuation" && token.type !== "keyword") {
+      return false;
+    }
+
+    return delimiters.has(token.value);
+  }
+
+  private parseRawExpressionUntil(
+    shouldStop: (
+      token: Token,
+      state: {
+        angleDepth: number;
+        parenDepth: number;
+        bracketDepth: number;
+        braceDepth: number;
+      },
+    ) => boolean,
+  ): RawExpr {
+    const start = this.peek().range.start;
+    const identifiers: Identifier[] = [];
+    const parts: string[] = [];
+    const state = {
+      angleDepth: 0,
+      parenDepth: 0,
+      bracketDepth: 0,
+      braceDepth: 0,
+    };
+
+    while (!this.match("eof", "")) {
+      const token = this.peek();
+      if (shouldStop(token, state)) {
+        break;
+      }
+
+      const consumed = this.advance();
+      parts.push(this.tokenText(consumed));
+      if (consumed.type === "identifier") {
+        identifiers.push({
+          type: "Identifier",
+          name: consumed.value,
+          range: consumed.range,
+        });
+      }
+
+      if (consumed.type !== "punctuation") {
+        continue;
+      }
+
+      switch (consumed.value) {
+        case "<":
+          state.angleDepth++;
+          break;
+        case ">":
+          state.angleDepth = Math.max(0, state.angleDepth - 1);
+          break;
+        case "(":
+          state.parenDepth++;
+          break;
+        case ")":
+          state.parenDepth = Math.max(0, state.parenDepth - 1);
+          break;
+        case "[":
+          state.bracketDepth++;
+          break;
+        case "]":
+          state.bracketDepth = Math.max(0, state.bracketDepth - 1);
+          break;
+        case "{":
+          state.braceDepth++;
+          break;
+        case "}":
+          state.braceDepth = Math.max(0, state.braceDepth - 1);
+          break;
+      }
+    }
+
+    return {
+      type: "RawExpr",
+      text: parts.join(""),
+      identifiers,
+      range: { start, end: this.peek().range.start },
+    };
   }
 
   private parseExpression(): Expression {
@@ -639,7 +815,7 @@ export class Parser {
         const args: Expression[] = [];
         this.advance(); // <
         while (!this.match("punctuation", ">") && !this.match("eof", "")) {
-          args.push(this.parseExpression());
+          args.push(this.parseDelimitedExpression(new Set([",", ">"])));
           if (this.match("punctuation", ",")) {
             this.advance();
           } else if (!this.match("punctuation", ">")) {
@@ -692,7 +868,7 @@ export class Parser {
     if (this.match("punctuation", "(")) {
       this.advance();
       while (!this.match("punctuation", ")") && !this.match("eof", "")) {
-        args.push(this.parseExpression());
+        args.push(this.parseDelimitedExpression(new Set([",", ")"])));
         if (this.match("punctuation", ",")) {
           this.advance();
         }
@@ -755,7 +931,7 @@ export class Parser {
     const elements: Expression[] = [];
 
     while (!this.match("punctuation", "]") && !this.match("eof", "")) {
-      elements.push(this.parseExpression());
+      elements.push(this.parseDelimitedExpression(new Set([",", "]"])));
       if (this.match("punctuation", ",")) {
         this.advance();
       }
@@ -886,7 +1062,7 @@ export class Parser {
     this.advance(); // def
 
     let name: Identifier | null = null;
-    if (this.match("identifier")) {
+    if (this.match("identifier") || this.match("string")) {
       name = this.parsePasteName();
     }
 
@@ -930,7 +1106,7 @@ export class Parser {
     this.advance(); // defm
 
     let name: Identifier | null = null;
-    if (this.match("identifier")) {
+    if (this.match("identifier") || this.match("string")) {
       name = this.parsePasteName();
     }
 
@@ -1026,7 +1202,7 @@ export class Parser {
       this.advance();
     }
 
-    const value = this.parseExpression();
+    const value = this.parseDelimitedExpression(new Set([";"]));
 
     if (this.match("punctuation", ";")) {
       this.advance();
@@ -1054,7 +1230,7 @@ export class Parser {
         this.advance();
       }
 
-      const value = this.parseExpression();
+      const value = this.parseDelimitedExpression(new Set([",", ";", "in"]));
 
       bindings.push({
         type: "LetBinding",
@@ -1106,7 +1282,7 @@ export class Parser {
       this.advance();
     }
 
-    const iterRange = this.parseExpression();
+    const iterRange = this.parseExpressionUntilKeyword("in");
 
     let body: Statement[] = [];
     if (this.match("keyword", "in")) {
@@ -1130,11 +1306,32 @@ export class Parser {
     };
   }
 
+  private parseExpressionUntilKeyword(keyword: string): Expression {
+    const startPos = this.pos;
+    const expr = this.parseRawExpressionUntil((token, state) => {
+      return (
+        state.angleDepth === 0 &&
+        state.parenDepth === 0 &&
+        state.bracketDepth === 0 &&
+        state.braceDepth === 0 &&
+        token.type === "keyword" &&
+        token.value === keyword
+      );
+    });
+
+    if (expr.text.length > 0) {
+      return expr;
+    }
+
+    this.pos = startPos;
+    return this.parseExpression();
+  }
+
   private parseIf(): IfStatement {
     const start = this.peek().range.start;
     this.advance(); // if
 
-    const condition = this.parseExpression();
+    const condition = this.parseDelimitedExpression(new Set(["then"]));
 
     let thenBody: Statement[] = [];
     if (this.match("keyword", "then")) {
@@ -1191,13 +1388,13 @@ export class Parser {
     const start = this.peek().range.start;
     this.advance(); // assert
 
-    const condition = this.parseExpression();
+    const condition = this.parseDelimitedExpression(new Set([","]));
 
     if (this.match("punctuation", ",")) {
       this.advance();
     }
 
-    const message = this.parseExpression();
+    const message = this.parseDelimitedExpression(new Set([";"]));
 
     if (this.match("punctuation", ";")) {
       this.advance();
@@ -1246,7 +1443,7 @@ export class Parser {
     let value: Expression | undefined;
     if (this.match("punctuation", "=")) {
       this.advance();
-      value = this.parseExpression();
+      value = this.parseDelimitedExpression(new Set([";"]));
     }
 
     if (this.match("punctuation", ";")) {

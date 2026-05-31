@@ -147,6 +147,7 @@ export type Expression =
   | NumberLiteral
   | StringLiteral
   | CodeLiteral
+  | RawExpr
   | ListExpr
   | DagExpr
   | BangOperator
@@ -169,6 +170,12 @@ export interface StringLiteral extends ASTNode {
 export interface CodeLiteral extends ASTNode {
   type: "CodeLiteral";
   value: string;
+}
+
+export interface RawExpr extends ASTNode {
+  type: "RawExpr";
+  text: string;
+  identifiers: Identifier[];
 }
 
 export interface ListExpr extends ASTNode {

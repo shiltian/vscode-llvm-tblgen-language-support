@@ -369,6 +369,9 @@ export class SymbolCollector {
         location: { uri: this.uri, range: arg.name.range },
         scope: this.currentScope,
       });
+      if (arg.defaultValue) {
+        this.collectExpression(arg.defaultValue);
+      }
     }
 
     // Collect references in parent classes
@@ -432,6 +435,9 @@ export class SymbolCollector {
         location: { uri: this.uri, range: arg.name.range },
         scope: this.currentScope,
       });
+      if (arg.defaultValue) {
+        this.collectExpression(arg.defaultValue);
+      }
     }
 
     for (const parent of stmt.parentClasses) {
@@ -620,6 +626,16 @@ export class SymbolCollector {
         this.collectExpression(expr.condition);
         this.collectExpression(expr.thenExpr);
         this.collectExpression(expr.elseExpr);
+        break;
+
+      case "RawExpr":
+        for (const identifier of expr.identifiers) {
+          this.symbolTable.addReference({
+            name: identifier.name,
+            location: { uri: this.uri, range: identifier.range },
+            scope: this.currentScope,
+          });
+        }
         break;
     }
   }
