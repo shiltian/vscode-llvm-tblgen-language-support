@@ -23,6 +23,17 @@ export class IncludeGraph {
   // File -> all files visible from it (in include order, cached)
   private visibleFilesCache: Map<string, string[]> = new Map();
 
+  // File -> raw include names. Shared includes are visited by many roots.
+  private includeNamesCache: Map<string, string[]> = new Map();
+
+  // Include lookup cache keyed by include name, including directory, and include paths.
+  private includeResolutionCache: Map<string, string | undefined> = new Map();
+
+  private includeNameCacheHits = 0;
+  private includeNameCacheMisses = 0;
+  private includeResolutionCacheHits = 0;
+  private includeResolutionCacheMisses = 0;
+
   private progressCallback?: ProgressCallback;
 
   setProgressCallback(callback: ProgressCallback): void {
@@ -42,7 +53,14 @@ export class IncludeGraph {
     this.reverseIncludes.clear();
     this.fileToRoot.clear();
     this.visibleFilesCache.clear();
+    this.includeNamesCache.clear();
+    this.includeResolutionCache.clear();
+    this.includeNameCacheHits = 0;
+    this.includeNameCacheMisses = 0;
+    this.includeResolutionCacheHits = 0;
+    this.includeResolutionCacheMisses = 0;
 
+    const startTime = Date.now();
     this.log(`Building include graph for ${this.rootFiles.size} root files...`);
 
     // For each root file, recursively parse includes
@@ -54,7 +72,9 @@ export class IncludeGraph {
     }
 
     this.log(
-      `Include graph built: ${this.forwardIncludes.size} files processed`,
+      `Include graph built: ${this.forwardIncludes.size} files processed in ${Date.now() - startTime}ms ` +
+        `(include cache hits/misses: ${this.includeNameCacheHits}/${this.includeNameCacheMisses}, ` +
+        `resolution hits/misses: ${this.includeResolutionCacheHits}/${this.includeResolutionCacheMisses})`,
     );
   }
 
@@ -98,23 +118,13 @@ export class IncludeGraph {
    * Parse include statements from a file and resolve them
    */
   private parseIncludes(filePath: string, includePaths: string[]): string[] {
-    if (!fs.existsSync(filePath)) {
-      return [];
-    }
-
-    let content: string;
-    try {
-      content = fs.readFileSync(filePath, "utf-8");
-    } catch {
+    const includeNames = this.getIncludeNames(filePath);
+    if (includeNames.length === 0) {
       return [];
     }
 
     const includes: string[] = [];
-    const includeRegex = /^\s*include\s+"([^"]+)"/gm;
-    let match;
-
-    while ((match = includeRegex.exec(content)) !== null) {
-      const includeName = match[1];
+    for (const includeName of includeNames) {
       const resolved = this.resolveInclude(includeName, filePath, includePaths);
       if (resolved) {
         includes.push(resolved);
@@ -122,6 +132,41 @@ export class IncludeGraph {
     }
 
     return includes;
+  }
+
+  private getIncludeNames(filePath: string): string[] {
+    const normalizedPath = path.normalize(filePath);
+    const cached = this.includeNamesCache.get(normalizedPath);
+    if (cached) {
+      this.includeNameCacheHits++;
+      return cached;
+    }
+
+    this.includeNameCacheMisses++;
+
+    if (!fs.existsSync(filePath)) {
+      this.includeNamesCache.set(normalizedPath, []);
+      return [];
+    }
+
+    let content: string;
+    try {
+      content = fs.readFileSync(filePath, "utf-8");
+    } catch {
+      this.includeNamesCache.set(normalizedPath, []);
+      return [];
+    }
+
+    const includeNames: string[] = [];
+    const includeRegex = /^\s*include\s+"([^"]+)"/gm;
+    let match;
+
+    while ((match = includeRegex.exec(content)) !== null) {
+      includeNames.push(match[1]);
+    }
+
+    this.includeNamesCache.set(normalizedPath, includeNames);
+    return includeNames;
   }
 
   /**
@@ -132,22 +177,53 @@ export class IncludeGraph {
     fromFile: string,
     includePaths: string[],
   ): string | undefined {
-    // First try relative to the including file
     const fromDir = path.dirname(fromFile);
+    const cacheKey = [
+      includeName,
+      fromDir,
+      ...includePaths.map((p) => path.normalize(p)),
+    ].join("\0");
+    if (this.includeResolutionCache.has(cacheKey)) {
+      this.includeResolutionCacheHits++;
+      return this.includeResolutionCache.get(cacheKey);
+    }
+
+    this.includeResolutionCacheMisses++;
+
+    // First try relative to the including file
     const relativePath = path.join(fromDir, includeName);
     if (fs.existsSync(relativePath)) {
-      return path.normalize(relativePath);
+      const resolved = path.normalize(relativePath);
+      this.includeResolutionCache.set(cacheKey, resolved);
+      return resolved;
     }
 
     // Then try each include path
     for (const incPath of includePaths) {
       const fullPath = path.join(incPath, includeName);
       if (fs.existsSync(fullPath)) {
-        return path.normalize(fullPath);
+        const resolved = path.normalize(fullPath);
+        this.includeResolutionCache.set(cacheKey, resolved);
+        return resolved;
       }
     }
 
+    this.includeResolutionCache.set(cacheKey, undefined);
     return undefined;
+  }
+
+  getCacheStats(): {
+    includeNameCacheHits: number;
+    includeNameCacheMisses: number;
+    includeResolutionCacheHits: number;
+    includeResolutionCacheMisses: number;
+  } {
+    return {
+      includeNameCacheHits: this.includeNameCacheHits,
+      includeNameCacheMisses: this.includeNameCacheMisses,
+      includeResolutionCacheHits: this.includeResolutionCacheHits,
+      includeResolutionCacheMisses: this.includeResolutionCacheMisses,
+    };
   }
 
   /**
@@ -298,6 +374,12 @@ export class IncludeGraph {
     this.reverseIncludes.clear();
     this.fileToRoot.clear();
     this.visibleFilesCache.clear();
+    this.includeNamesCache.clear();
+    this.includeResolutionCache.clear();
+    this.includeNameCacheHits = 0;
+    this.includeNameCacheMisses = 0;
+    this.includeResolutionCacheHits = 0;
+    this.includeResolutionCacheMisses = 0;
   }
 
   /**

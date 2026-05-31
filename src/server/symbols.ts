@@ -28,19 +28,26 @@ export class SymbolTable {
   // Scoped symbols: scope -> name -> symbols
   private scopedSymbols: Map<string, Map<string, Symbol[]>> = new Map();
 
-  // All references (for find references / rename)
-  private references: SymbolReference[] = [];
+  // All symbols/references by name for hot rename and definition paths
+  private symbolsByName: Map<string, Symbol[]> = new Map();
+  private referencesByName: Map<string, SymbolReference[]> = new Map();
 
   // File -> symbols mapping for incremental updates
   private fileSymbols: Map<string, Symbol[]> = new Map();
   private fileReferences: Map<string, SymbolReference[]> = new Map();
+  private fileSymbolLineIndex: Map<string, Map<number, Symbol[]>> = new Map();
+  private fileReferenceLineIndex: Map<string, Map<number, SymbolReference[]>> =
+    new Map();
 
   clear(): void {
     this.globalSymbols.clear();
     this.scopedSymbols.clear();
-    this.references = [];
+    this.symbolsByName.clear();
+    this.referencesByName.clear();
     this.fileSymbols.clear();
     this.fileReferences.clear();
+    this.fileSymbolLineIndex.clear();
+    this.fileReferenceLineIndex.clear();
   }
 
   clearFile(uri: string): void {
@@ -52,24 +59,49 @@ export class SymbolTable {
         if (scopeMap) {
           const syms = scopeMap.get(sym.name);
           if (syms) {
-            const idx = syms.findIndex((s) => s.location.uri === uri);
-            if (idx >= 0) syms.splice(idx, 1);
+            this.removeFromArray(syms, sym);
+            if (syms.length === 0) {
+              scopeMap.delete(sym.name);
+            }
+          }
+          if (scopeMap.size === 0) {
+            this.scopedSymbols.delete(sym.scope);
           }
         }
       } else {
         const syms = this.globalSymbols.get(sym.name);
         if (syms) {
-          const idx = syms.findIndex((s) => s.location.uri === uri);
-          if (idx >= 0) syms.splice(idx, 1);
+          this.removeFromArray(syms, sym);
+          if (syms.length === 0) {
+            this.globalSymbols.delete(sym.name);
+          }
+        }
+      }
+
+      const byName = this.symbolsByName.get(sym.name);
+      if (byName) {
+        this.removeFromArray(byName, sym);
+        if (byName.length === 0) {
+          this.symbolsByName.delete(sym.name);
         }
       }
     }
     this.fileSymbols.delete(uri);
+    this.fileSymbolLineIndex.delete(uri);
 
     // Remove old references from this file
     const oldRefs = this.fileReferences.get(uri) || [];
-    this.references = this.references.filter((r) => r.location.uri !== uri);
+    for (const ref of oldRefs) {
+      const refs = this.referencesByName.get(ref.name);
+      if (refs) {
+        this.removeFromArray(refs, ref);
+        if (refs.length === 0) {
+          this.referencesByName.delete(ref.name);
+        }
+      }
+    }
     this.fileReferences.delete(uri);
+    this.fileReferenceLineIndex.delete(uri);
   }
 
   addSymbol(symbol: Symbol): void {
@@ -85,6 +117,8 @@ export class SymbolTable {
       this.fileSymbols.set(uri, []);
     }
     this.fileSymbols.get(uri)!.push(symbol);
+    this.addToMapArray(this.symbolsByName, symbol.name, symbol);
+    this.addToLineIndex(this.fileSymbolLineIndex, uri, symbol);
 
     // Add to appropriate index
     if (symbol.scope) {
@@ -111,7 +145,8 @@ export class SymbolTable {
       this.fileReferences.set(uri, []);
     }
     this.fileReferences.get(uri)!.push(ref);
-    this.references.push(ref);
+    this.addToMapArray(this.referencesByName, ref.name, ref);
+    this.addToLineIndex(this.fileReferenceLineIndex, uri, ref);
   }
 
   findDefinition(name: string, scope?: string): Symbol | undefined {
@@ -140,19 +175,7 @@ export class SymbolTable {
   }
 
   findAllDefinitions(name: string): Symbol[] {
-    const results: Symbol[] = [];
-
-    const globalSyms = this.globalSymbols.get(name);
-    if (globalSyms) {
-      results.push(...globalSyms);
-    }
-
-    for (const scopeMap of this.scopedSymbols.values()) {
-      const scopedSyms = scopeMap.get(name);
-      if (scopedSyms) {
-        results.push(...scopedSyms);
-      }
-    }
+    const results = [...(this.symbolsByName.get(name) || [])];
 
     // Sort: definitions first, then forward declarations
     results.sort((a, b) => {
@@ -165,7 +188,7 @@ export class SymbolTable {
   }
 
   findReferences(name: string): SymbolReference[] {
-    return this.references.filter((ref) => ref.name === name);
+    return [...(this.referencesByName.get(name) || [])];
   }
 
   getAllSymbolsInFile(uri: string): Symbol[] {
@@ -178,7 +201,7 @@ export class SymbolTable {
     character: number,
   ): { name: string; scope?: string } | undefined {
     // Check references first (more common)
-    const refs = this.fileReferences.get(uri) || [];
+    const refs = this.fileReferenceLineIndex.get(uri)?.get(line) || [];
     for (const ref of refs) {
       if (this.isPositionInRange(line, character, ref.location.range)) {
         return { name: ref.name, scope: ref.scope };
@@ -186,7 +209,7 @@ export class SymbolTable {
     }
 
     // Check symbols
-    const symbols = this.fileSymbols.get(uri) || [];
+    const symbols = this.fileSymbolLineIndex.get(uri)?.get(line) || [];
     for (const sym of symbols) {
       if (this.isPositionInRange(line, character, sym.location.range)) {
         return { name: sym.name, scope: sym.scope };
@@ -213,16 +236,54 @@ export class SymbolTable {
     return true;
   }
 
+  private addToMapArray<T>(map: Map<string, T[]>, key: string, value: T): void {
+    if (!map.has(key)) {
+      map.set(key, []);
+    }
+    map.get(key)!.push(value);
+  }
+
+  private removeFromArray<T>(values: T[], value: T): void {
+    const idx = values.indexOf(value);
+    if (idx >= 0) {
+      values.splice(idx, 1);
+    }
+  }
+
+  private addToLineIndex<T extends { location: Location }>(
+    index: Map<string, Map<number, T[]>>,
+    uri: string,
+    value: T,
+  ): void {
+    let lineMap = index.get(uri);
+    if (!lineMap) {
+      lineMap = new Map();
+      index.set(uri, lineMap);
+    }
+
+    for (
+      let line = value.location.range.start.line;
+      line <= value.location.range.end.line;
+      line++
+    ) {
+      if (!lineMap.has(line)) {
+        lineMap.set(line, []);
+      }
+      lineMap.get(line)!.push(value);
+    }
+  }
+
   // Export all symbols and references for caching
   exportData(): { symbols: Symbol[]; references: SymbolReference[] } {
     const symbols: Symbol[] = [];
     for (const syms of this.fileSymbols.values()) {
       symbols.push(...syms);
     }
-    return {
-      symbols,
-      references: [...this.references],
-    };
+    const references: SymbolReference[] = [];
+    for (const refs of this.fileReferences.values()) {
+      references.push(...refs);
+    }
+    return { symbols, references };
   }
 
   // Import symbols and references from cache

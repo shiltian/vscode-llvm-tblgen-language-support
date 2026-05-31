@@ -158,3 +158,35 @@ test("getSymbolAtPosition prefers references over symbols", () => {
   assert.ok(atPos);
   assert.equal(atPos.name, "Ref");
 });
+
+test("importData rebuilds name and position lookup indexes", () => {
+  const source = new SymbolTable();
+  const uri = "file:///imported.td";
+  const symbolRange = {
+    start: { line: 3, character: 2 },
+    end: { line: 3, character: 8 },
+  };
+  const refRange = {
+    start: { line: 5, character: 4 },
+    end: { line: 5, character: 10 },
+  };
+
+  source.addSymbol({
+    name: "Imported",
+    kind: "def",
+    location: { uri, range: symbolRange },
+  });
+  source.addReference({
+    name: "Imported",
+    location: { uri, range: refRange },
+  });
+
+  const restored = new SymbolTable();
+  const exported = source.exportData();
+  restored.importData(exported.symbols, exported.references);
+
+  assert.equal(restored.findAllDefinitions("Imported").length, 1);
+  assert.equal(restored.findReferences("Imported").length, 1);
+  assert.equal(restored.getSymbolAtPosition(uri, 3, 3)?.name, "Imported");
+  assert.equal(restored.getSymbolAtPosition(uri, 5, 5)?.name, "Imported");
+});

@@ -54,6 +54,19 @@ const typeSystem = new TypeSystem();
 const includeGraph = new IncludeGraph();
 const parsedFiles = new Map<string, ParsedFile>();
 const indexedFiles = new Set<string>(); // Track which files have been indexed
+const fileMulticlassNodes = new Map<string, MultiClassDef[]>();
+const multiclassIndex = new Map<string, MultiClassDef[]>();
+
+const DOCUMENT_PARSE_DEBOUNCE_MS = 150;
+const INDEX_BATCH_SIZE = 25;
+const SLOW_PARSE_LOG_MS = 25;
+
+type PendingDocumentParse = {
+  timer: NodeJS.Timeout;
+  document: TextDocument;
+};
+
+const pendingDocumentParses = new Map<string, PendingDocumentParse>();
 
 // Workspace state
 let workspaceFolders: string[] = [];
@@ -76,6 +89,22 @@ function sendLog(message: string) {
   const now = new Date();
   const timestamp = now.toISOString().replace("T", " ").slice(0, 23);
   connection.console.log(`[${timestamp}] ${message}`);
+}
+
+function formatElapsed(startTime: number): string {
+  return `${Date.now() - startTime}ms`;
+}
+
+function filePathToUri(filePath: string): string {
+  return "file://" + filePath;
+}
+
+function uriToFilePath(uri: string): string {
+  return uri.replace("file://", "");
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
@@ -195,8 +224,11 @@ async function buildIncludeGraph(): Promise<void> {
     sendLog("Parsing compile commands...");
     sendStatus("Building include graph...", "progress");
 
+    const compileCommandsStart = Date.now();
     const commands = parseCompileCommands(ccPath);
-    sendLog(`Found ${commands.length} compilation units`);
+    sendLog(
+      `Found ${commands.length} compilation units in ${formatElapsed(compileCommandsStart)}`,
+    );
 
     if (commands.length === 0) {
       sendLog("No compilation units found in compile commands file");
@@ -213,8 +245,7 @@ async function buildIncludeGraph(): Promise<void> {
     includeGraph.setProgressCallback((msg) => sendLog(msg));
     includeGraph.initialize(rootFileMap);
 
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    sendLog(`Include graph built in ${elapsed}s`);
+    sendLog(`Include graph initialized in ${formatElapsed(startTime)}`);
     sendStatus("TableGen ready", "ready");
 
     isGraphBuilt = true;
@@ -270,10 +301,11 @@ async function ensureFilesIndexed(filePath: string): Promise<boolean> {
   const startTime = Date.now();
   let indexed = 0;
   let errors = 0;
+  let filesSinceYield = 0;
 
   for (const file of toIndex) {
     try {
-      const uri = "file://" + file;
+      const uri = filePathToUri(file);
       parseAndIndexFile(uri);
       indexedFiles.add(file);
       indexed++;
@@ -283,20 +315,31 @@ async function ensureFilesIndexed(filePath: string): Promise<boolean> {
         `Error indexing ${path.basename(file)}: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
+
+    filesSinceYield++;
+    if (filesSinceYield >= INDEX_BATCH_SIZE) {
+      filesSinceYield = 0;
+      await yieldToEventLoop();
+    }
+  }
+
+  if (filesSinceYield > 0) {
+    await yieldToEventLoop();
   }
 
   // Second pass: register composite defm symbols now that all multiclass
   // definitions are available in parsedFiles
   for (const file of toIndex) {
-    const uri = "file://" + file;
+    const uri = filePathToUri(file);
     const parsed = parsedFiles.get(uri);
     if (parsed) {
       registerCompositeDefmSymbols(parsed, uri);
     }
   }
 
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  sendLog(`Indexed ${indexed} files (${errors} errors) in ${elapsed}s`);
+  sendLog(
+    `Indexed ${indexed} files (${errors} errors) in ${formatElapsed(startTime)}`,
+  );
   sendStatus("TableGen ready", "ready");
 
   return true;
@@ -308,14 +351,29 @@ async function ensureFilesIndexed(filePath: string): Promise<boolean> {
 function parseAndIndexFile(uri: string): ParsedFile | undefined {
   let content: string;
   try {
-    const filePath = uri.replace("file://", "");
-    content = fs.readFileSync(filePath, "utf-8");
+    const openDocument = documents.get(uri);
+    if (openDocument) {
+      content = openDocument.getText();
+    } else {
+      const filePath = uriToFilePath(uri);
+      content = fs.readFileSync(filePath, "utf-8");
+    }
   } catch {
     return undefined;
   }
 
+  return parseAndIndexText(uri, content);
+}
+
+function parseAndIndexText(
+  uri: string,
+  content: string,
+  options: { registerCompositeSymbols?: boolean } = {},
+): ParsedFile {
+  const startTime = Date.now();
   const parsed = parseTableGen(content, uri);
   parsedFiles.set(uri, parsed);
+  updateMulticlassIndex(uri, parsed);
 
   // Collect symbols
   symbolTable.clearFile(uri);
@@ -327,21 +385,60 @@ function parseAndIndexFile(uri: string): ParsedFile | undefined {
   const typeCollector = new TypeCollector(typeSystem, uri);
   typeCollector.collect(parsed);
 
+  if (options.registerCompositeSymbols) {
+    registerCompositeDefmSymbols(parsed, uri);
+  }
+
+  const elapsedMs = Date.now() - startTime;
+  if (elapsedMs >= SLOW_PARSE_LOG_MS) {
+    sendLog(`Parsed and indexed ${path.basename(uri)} in ${elapsedMs}ms`);
+  }
+
   return parsed;
 }
 
 /**
- * Find a MultiClassDef node by name across all parsed files.
+ * Update the multiclass lookup for one parsed file.
  */
-function findMulticlassNode(name: string): MultiClassDef | undefined {
-  for (const parsed of parsedFiles.values()) {
-    for (const stmt of parsed.statements) {
-      if (stmt.type === "MultiClassDef" && stmt.name.name === name) {
-        return stmt;
-      }
+function updateMulticlassIndex(uri: string, parsed: ParsedFile): void {
+  const previousNodes = fileMulticlassNodes.get(uri) || [];
+  for (const node of previousNodes) {
+    const nodesByName = multiclassIndex.get(node.name.name);
+    if (!nodesByName) {
+      continue;
+    }
+    const idx = nodesByName.indexOf(node);
+    if (idx >= 0) {
+      nodesByName.splice(idx, 1);
+    }
+    if (nodesByName.length === 0) {
+      multiclassIndex.delete(node.name.name);
     }
   }
-  return undefined;
+
+  const nextNodes: MultiClassDef[] = [];
+  for (const stmt of parsed.statements) {
+    if (stmt.type === "MultiClassDef") {
+      nextNodes.push(stmt);
+      if (!multiclassIndex.has(stmt.name.name)) {
+        multiclassIndex.set(stmt.name.name, []);
+      }
+      multiclassIndex.get(stmt.name.name)!.push(stmt);
+    }
+  }
+
+  if (nextNodes.length > 0) {
+    fileMulticlassNodes.set(uri, nextNodes);
+  } else {
+    fileMulticlassNodes.delete(uri);
+  }
+}
+
+/**
+ * Find a MultiClassDef node by name.
+ */
+function findMulticlassNode(name: string): MultiClassDef | undefined {
+  return multiclassIndex.get(name)?.[0];
 }
 
 /**
@@ -372,12 +469,15 @@ async function ensureGraphBuilt(): Promise<void> {
 
 async function forceReindex(): Promise<void> {
   sendLog("Force reindex requested...");
+  flushPendingDocumentParses();
 
   // Clear all in-memory state
   symbolTable.clear();
   typeSystem.clear();
   parsedFiles.clear();
   indexedFiles.clear();
+  fileMulticlassNodes.clear();
+  multiclassIndex.clear();
   includeGraph.clear();
 
   // Reset state
@@ -394,35 +494,58 @@ connection.onRequest("tablegen/reindex", async () => {
   return { success: true };
 });
 
+function parseAndIndexDocument(
+  document: TextDocument,
+  options: { registerCompositeSymbols?: boolean } = {},
+): ParsedFile {
+  const parsed = parseAndIndexText(document.uri, document.getText(), options);
+  indexedFiles.add(path.normalize(uriToFilePath(document.uri)));
+  return parsed;
+}
+
+function scheduleDocumentParse(document: TextDocument): void {
+  const existing = pendingDocumentParses.get(document.uri);
+  if (existing) {
+    clearTimeout(existing.timer);
+  }
+
+  const timer = setTimeout(() => {
+    pendingDocumentParses.delete(document.uri);
+    parseAndIndexDocument(document, { registerCompositeSymbols: true });
+  }, DOCUMENT_PARSE_DEBOUNCE_MS);
+
+  pendingDocumentParses.set(document.uri, { timer, document });
+}
+
+function flushPendingDocumentParse(uri: string): void {
+  const pending = pendingDocumentParses.get(uri);
+  if (!pending) {
+    return;
+  }
+
+  clearTimeout(pending.timer);
+  pendingDocumentParses.delete(uri);
+  parseAndIndexDocument(pending.document, { registerCompositeSymbols: true });
+}
+
+function flushPendingDocumentParses(): void {
+  for (const uri of Array.from(pendingDocumentParses.keys())) {
+    flushPendingDocumentParse(uri);
+  }
+}
+
 // Document change handlers
 documents.onDidOpen(async (event) => {
-  const filePath = event.document.uri.replace("file://", "");
+  const filePath = uriToFilePath(event.document.uri);
   await ensureFilesIndexed(filePath);
 });
 
 documents.onDidChangeContent((event) => {
-  const uri = event.document.uri;
-  const content = event.document.getText();
-
-  // Re-parse the changed file
-  const parsed = parseTableGen(content, uri);
-  parsedFiles.set(uri, parsed);
-
-  // Re-collect symbols
-  symbolTable.clearFile(uri);
-  const symbolCollector = new SymbolCollector(symbolTable, uri);
-  symbolCollector.collect(parsed);
-
-  // Re-collect type information
-  typeSystem.clearFile(uri);
-  const typeCollector = new TypeCollector(typeSystem, uri);
-  typeCollector.collect(parsed);
-
-  // Re-register composite defm symbols (multiclasses already indexed from initial pass)
-  registerCompositeDefmSymbols(parsed, uri);
+  scheduleDocumentParse(event.document);
 });
 
-documents.onDidClose(() => {
+documents.onDidClose((event) => {
+  flushPendingDocumentParse(event.document.uri);
   // Keep parsed data for cross-file references
 });
 
@@ -430,9 +553,10 @@ documents.onDidClose(() => {
 connection.onDefinition(
   async (params: DefinitionParams): Promise<Location | null> => {
     await ensureGraphBuilt();
+    flushPendingDocumentParses();
 
     const uri = params.textDocument.uri;
-    const filePath = uri.replace("file://", "");
+    const filePath = uriToFilePath(uri);
     const line = params.position.line;
     const character = params.position.character;
 
@@ -493,7 +617,7 @@ connection.onDefinition(
     }
 
     // Search for definition only in visible files
-    const visibleUris = new Set(visibleFiles.map((f) => "file://" + f));
+    const visibleUris = new Set(visibleFiles.map((f) => filePathToUri(f)));
 
     sendLog(
       `Looking for '${symbolName}' (scope: ${symbolScope || "none"}) in ${visibleFiles.length} visible files`,
@@ -740,7 +864,7 @@ function resolveFieldAccessDefinition(
   }
 
   // Check if the field's location is in visible files
-  const visibleUris = new Set(visibleFiles.map((f) => "file://" + f));
+  const visibleUris = new Set(visibleFiles.map((f) => filePathToUri(f)));
   if (!visibleUris.has(fieldInfo.location.uri)) {
     sendLog(`Field access: field definition not in visible files`);
     return null;
@@ -855,30 +979,17 @@ function findScopeInStatement(
       }
       return undefined;
     case "MultiClassDef":
-      // Check inside the multiclass body for let statements
-      sendLog(
-        `MultiClassDef ${stmt.name.name}: checking ${(stmt.body || []).length} body statements`,
-      );
       for (const bodyStmt of stmt.body || []) {
-        sendLog(
-          `  Body stmt type: ${bodyStmt.type}, range: ${bodyStmt.range?.start?.line}-${bodyStmt.range?.end?.line}`,
-        );
         if (isPositionInRange(position, bodyStmt.range)) {
-          sendLog(`  Position is in this statement`);
           const nested = findScopeInStatement(bodyStmt, position);
-          sendLog(`  Nested scope result: ${nested}`);
           if (nested) {
             return nested;
           }
         }
       }
       // Fall back to multiclass scope if not in a more specific context
-      sendLog(`  Falling back to multiclass scope`);
       return `multiclass:${stmt.name.name}`;
     case "LetStatement":
-      sendLog(
-        `LetStatement: checking ${(stmt.body || []).length} body statements`,
-      );
       // Check nested statements first
       for (const bodyStmt of stmt.body || []) {
         const nested = findScopeInStatement(bodyStmt, position);
@@ -888,9 +999,7 @@ function findScopeInStatement(
       }
       // If we're in the let but not in a nested def,
       // look at what defs are in the body to find field definitions
-      const letResult = findFirstDefInLetBody(stmt);
-      sendLog(`LetStatement: findFirstDefInLetBody returned: ${letResult}`);
-      return letResult;
+      return findFirstDefInLetBody(stmt);
     case "ForeachStatement":
       // Check nested statements first
       for (const bodyStmt of stmt.body || []) {
@@ -1090,9 +1199,10 @@ function resolveIdentifierType(
 connection.onPrepareRename(
   async (params: PrepareRenameParams): Promise<LSPRange | null> => {
     await ensureGraphBuilt();
+    flushPendingDocumentParses();
 
     const uri = params.textDocument.uri;
-    const filePath = uri.replace("file://", "");
+    const filePath = uriToFilePath(uri);
     const doc = documents.get(uri);
     if (!doc) return null;
 
@@ -1118,9 +1228,10 @@ connection.onPrepareRename(
 connection.onRenameRequest(
   async (params: RenameParams): Promise<WorkspaceEdit | null> => {
     await ensureGraphBuilt();
+    flushPendingDocumentParses();
 
     const uri = params.textDocument.uri;
-    const filePath = uri.replace("file://", "");
+    const filePath = uriToFilePath(uri);
     const doc = documents.get(uri);
     if (!doc) return null;
 
@@ -1132,7 +1243,7 @@ connection.onRenameRequest(
 
     // Get visible files for scope
     const visibleFiles = includeGraph.getVisibleFiles(filePath);
-    const visibleUris = new Set(visibleFiles.map((f) => "file://" + f));
+    const visibleUris = new Set(visibleFiles.map((f) => filePathToUri(f)));
 
     const newName = params.newName;
     const changes: { [uri: string]: TextEdit[] } = {};
@@ -1173,9 +1284,10 @@ connection.onRenameRequest(
 connection.onDocumentSymbol(
   async (params: DocumentSymbolParams): Promise<SymbolInformation[]> => {
     await ensureGraphBuilt();
+    flushPendingDocumentParses();
 
     const uri = params.textDocument.uri;
-    const filePath = uri.replace("file://", "");
+    const filePath = uriToFilePath(uri);
 
     // Ensure this file is indexed
     await ensureFilesIndexed(filePath);
