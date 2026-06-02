@@ -266,3 +266,21 @@ let append Predicates = [HasFoo] in def D : Base;
     assert.ok(table.findReferences(name).length > 0, name);
   }
 });
+
+test("pasted generated names keep parent and value references", () => {
+  const table = collectSymbols(`
+foreach I = [0, 2] in {
+  def R#I#_R#!add(I, 1)#_suffix : Tuple<"_suffix", I>;
+}
+def D : Base<"R"#Index,
+             !cast<Node>("N"#Index),
+             (op !cast<Node>("V"#Index):$src)>;
+class C<int N = !cond(!eq(A, B) : !add(A, 1), true : !mul(B, 2))>;
+`);
+
+  assert.ok(table.findDefinition("R#I#_R#!add(I,1)#_suffix"));
+  assert.ok(table.findDefinition("D"));
+  for (const name of ["Tuple", "Base", "Node", "Index", "A", "B"]) {
+    assert.ok(table.findReferences(name).length > 0, name);
+  }
+});

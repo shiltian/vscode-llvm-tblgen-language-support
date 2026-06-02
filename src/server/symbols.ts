@@ -612,6 +612,13 @@ export class SymbolCollector {
         break;
 
       case "BangOperator":
+        for (const identifier of expr.typeArgIdentifiers || []) {
+          this.symbolTable.addReference({
+            name: identifier.name,
+            location: { uri: this.uri, range: identifier.range },
+            scope: this.currentScope,
+          });
+        }
         for (const arg of expr.args) {
           this.collectExpression(arg);
         }

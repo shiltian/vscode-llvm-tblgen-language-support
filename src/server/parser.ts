@@ -437,35 +437,73 @@ export class Parser {
 
   private parsePasteName(): Identifier {
     const start = this.peek().range.start;
-    const first = this.parseNamePart();
-    let name = first.name;
-    let end = first.range.end;
-
-    while (this.match("operator", "#")) {
-      this.advance();
-      if (
-        !this.isNamePartStart(this.peek()) &&
-        !this.isObjectNameTerminator(this.peek())
-      ) {
-        break;
-      }
-      if (this.isObjectNameTerminator(this.peek())) {
-        // LLVM allows a trailing paste before the object body. Preserve it as
-        // source spelling but stop before consuming the body token.
-        name += "#";
-        end = this.previousTokenEnd();
-        break;
-      }
-      const next = this.parseNamePart();
-      name += "#" + next.name;
-      end = next.range.end;
-    }
+    const name = this.collectObjectNameText();
+    const end = this.previousTokenEnd();
 
     return {
       type: "Identifier",
       name,
       range: { start, end },
     };
+  }
+
+  private collectObjectNameText(): string {
+    const parts: string[] = [];
+    const state = {
+      angleDepth: 0,
+      parenDepth: 0,
+      bracketDepth: 0,
+      braceDepth: 0,
+    };
+
+    while (!this.match("eof", "")) {
+      const token = this.peek();
+      if (
+        state.angleDepth === 0 &&
+        state.parenDepth === 0 &&
+        state.bracketDepth === 0 &&
+        state.braceDepth === 0 &&
+        this.isObjectNameTerminator(token)
+      ) {
+        break;
+      }
+
+      const consumed = this.advance();
+      parts.push(this.tokenText(consumed));
+
+      if (consumed.type !== "punctuation") {
+        continue;
+      }
+
+      switch (consumed.value) {
+        case "<":
+          state.angleDepth++;
+          break;
+        case ">":
+          state.angleDepth = Math.max(0, state.angleDepth - 1);
+          break;
+        case "(":
+          state.parenDepth++;
+          break;
+        case ")":
+          state.parenDepth = Math.max(0, state.parenDepth - 1);
+          break;
+        case "[":
+          state.bracketDepth++;
+          break;
+        case "]":
+          state.bracketDepth = Math.max(0, state.bracketDepth - 1);
+          break;
+        case "{":
+          state.braceDepth++;
+          break;
+        case "}":
+          state.braceDepth = Math.max(0, state.braceDepth - 1);
+          break;
+      }
+    }
+
+    return parts.join("");
   }
 
   private isNamePartStart(token: Token): boolean {
@@ -909,7 +947,7 @@ export class Parser {
     const start = this.peek().range.start;
     const opToken = this.advance();
     const operator = opToken.value;
-    const typeArgText = this.parseBangTypeArgumentText();
+    const typeArg = this.parseBangTypeArgument();
     const args: Expression[] = [];
 
     if (this.match("punctuation", "(")) {
@@ -928,20 +966,25 @@ export class Parser {
     return {
       type: "BangOperator",
       operator,
-      typeArgText,
+      typeArgText: typeArg.text,
+      typeArgIdentifiers: typeArg.identifiers,
       args,
       range: { start, end: this.peek().range.start },
     };
   }
 
-  private parseBangTypeArgumentText(): string | undefined {
+  private parseBangTypeArgument(): {
+    text?: string;
+    identifiers?: Identifier[];
+  } {
     if (!this.match("punctuation", "<")) {
-      return undefined;
+      return {};
     }
 
     this.advance(); // <
     let angleDepth = 1;
     const typeTokens: string[] = [];
+    const identifiers: Identifier[] = [];
 
     while (angleDepth > 0 && !this.match("eof", "")) {
       const token = this.advance();
@@ -966,10 +1009,20 @@ export class Parser {
       typeTokens.push(
         token.type === "string" ? `"${token.value}"` : token.value,
       );
+      if (token.type === "identifier") {
+        identifiers.push({
+          type: "Identifier",
+          name: token.value,
+          range: token.range,
+        });
+      }
     }
 
     const typeArgText = typeTokens.join("").trim();
-    return typeArgText.length > 0 ? typeArgText : undefined;
+    return {
+      text: typeArgText.length > 0 ? typeArgText : undefined,
+      identifiers: identifiers.length > 0 ? identifiers : undefined,
+    };
   }
 
   private parseList(): Expression {

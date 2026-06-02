@@ -201,6 +201,7 @@ export interface BangOperator extends ASTNode {
   type: "BangOperator";
   operator: string;
   typeArgText?: string;
+  typeArgIdentifiers?: Identifier[];
   args: Expression[];
 }
 

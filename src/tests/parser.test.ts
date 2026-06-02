@@ -315,6 +315,89 @@ multiclass M<GFXGen Gen> {
   assert.equal(multiclass.body[2].name?.name, "_dpp8#Gen.Suffix");
 });
 
+test("parses full bang expressions as generated object names", () => {
+  const parsed = parse(`
+foreach Size = [2, 4] in {
+  def !make_name(!foreach(I, !range(Size), "part"#!add(I, 1)), "_") : Base<!mul(Size, 32)>;
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 1);
+  const foreachStmt = parsed.statements[0];
+  assert.equal(foreachStmt.type, "ForeachStatement");
+  assert.equal(foreachStmt.body.length, 1);
+  const def = foreachStmt.body[0];
+  assert.equal(def.type, "RecordDef");
+  assert.ok(def.name?.name.startsWith("!make_name("));
+  assert.equal(def.parentClasses.length, 1);
+  assert.equal(def.parentClasses[0].name.name, "Base");
+  assert.equal(def.parentClasses[0].args.length, 1);
+});
+
+test("parses arbitrary value-like pieces after paste operators", () => {
+  const parsed = parse(`
+foreach I = [0, 2] in {
+  def R#I#_R#!add(I, 1)#_suffix : Tuple<"_suffix", I>;
+  def R#I#_R#!add(I, 2)#_alt : Tuple<"_alt", I>;
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const foreachStmt = parsed.statements[0];
+  assert.equal(foreachStmt.type, "ForeachStatement");
+  assert.equal(foreachStmt.body.length, 2);
+  assert.equal(foreachStmt.body[0].type, "RecordDef");
+  assert.equal(foreachStmt.body[0].name?.name, "R#I#_R#!add(I,1)#_suffix");
+  assert.equal(foreachStmt.body[0].parentClasses[0].name.name, "Tuple");
+  assert.equal(foreachStmt.body[1].type, "RecordDef");
+  assert.equal(foreachStmt.body[1].name?.name, "R#I#_R#!add(I,2)#_alt");
+  assert.equal(foreachStmt.body[1].parentClasses[0].name.name, "Tuple");
+});
+
+test("parses multiline pasted generated names", () => {
+  const parsed = parse(`
+foreach I = [0, 4] in {
+  def Pair#I#
+      _Next#!add(I, 1)#
+      _End : Tuple<I>;
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const foreachStmt = parsed.statements[0];
+  assert.equal(foreachStmt.type, "ForeachStatement");
+  assert.equal(foreachStmt.body.length, 1);
+  const def = foreachStmt.body[0];
+  assert.equal(def.type, "RecordDef");
+  assert.equal(def.name?.name, "Pair#I#_Next#!add(I,1)#_End");
+  assert.equal(def.parentClasses[0].name.name, "Tuple");
+  assert.equal(def.parentClasses[0].args.length, 1);
+});
+
+test("parses spaced paste and string name pieces", () => {
+  const parsed = parse(`
+foreach Suffix = ["A", "B"] in {
+  def "" # Prefix # !if(UseAlt, "_ALT", "") : Base;
+  def Item_ # Suffix : Base;
+}
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  const foreachStmt = parsed.statements[0];
+  assert.equal(foreachStmt.type, "ForeachStatement");
+  assert.equal(foreachStmt.body.length, 2);
+  assert.equal(foreachStmt.body[0].type, "RecordDef");
+  assert.equal(
+    foreachStmt.body[0].name?.name,
+    '""#Prefix#!if(UseAlt,"_ALT","")',
+  );
+  assert.equal(foreachStmt.body[0].parentClasses[0].name.name, "Base");
+  assert.equal(foreachStmt.body[1].type, "RecordDef");
+  assert.equal(foreachStmt.body[1].name?.name, "Item_#Suffix");
+  assert.equal(foreachStmt.body[1].parentClasses[0].name.name, "Base");
+});
+
 test("parses bang operators in class and template arguments", () => {
   const parsed = parse(`
 def Type#Index#"_8bit" : Extract<!shl(Index, 3), 255, !eq(Type, "U")>;
@@ -408,6 +491,27 @@ defvar L = !foreach(I, [0, 1], I # "x");
   assert.equal(parsed.statements[2].type, "DefvarDef");
 });
 
+test("recovers paste expressions inside template and DAG values", () => {
+  const parsed = parse(`
+def D : Base<"R"#Index,
+             !cast<Node>("N"#Index),
+             (op !cast<Node>("V"#Index):$src)>;
+class C<int N = !cond(!eq(A, B) : !add(A, 1), true : !mul(B, 2))>;
+`);
+
+  assert.equal(parsed.errors.length, 0);
+  assert.equal(parsed.statements.length, 2);
+  const def = parsed.statements[0];
+  assert.equal(def.type, "RecordDef");
+  assert.equal(def.name?.name, "D");
+  assert.equal(def.parentClasses[0].name.name, "Base");
+  assert.equal(def.parentClasses[0].args.length, 3);
+  const cls = parsed.statements[1];
+  assert.equal(cls.type, "ClassDef");
+  assert.equal(cls.templateArgs.length, 1);
+  assert.ok(cls.templateArgs[0].defaultValue);
+});
+
 test("parses foreach ranges and indexed field expressions", () => {
   const parsed = parse(`
 foreach Index = 0-3 in {
@@ -438,6 +542,18 @@ class Good<int N = !unsupported((A, B), [C, D])>;
 class {
 `);
 
+  assert.equal(parsed.errors.length, 1);
+  assert.match(parsed.errors[0].message, /Expected identifier/);
+});
+
+test("suppresses generated-name cascades while preserving true errors", () => {
+  const parsed = parse(`
+def Good#!make_name(A, B) : Base<!unsupported((A, B), [C])>;
+class {
+`);
+
+  assert.equal(parsed.statements[0].type, "RecordDef");
+  assert.equal(parsed.statements[0].name?.name, "Good#!make_name(A,B)");
   assert.equal(parsed.errors.length, 1);
   assert.match(parsed.errors[0].message, /Expected identifier/);
 });
